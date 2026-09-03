@@ -66,6 +66,57 @@ func Test_SQLiteDB_SaveLoadDeleteLinks(t *testing.T) {
 	}
 }
 
+// Test that the Admins table grants admin rights to both users and groups,
+// case-insensitively.
+func Test_SQLiteDB_IsAdmin(t *testing.T) {
+	db, err := NewSQLiteDB(path.Join(t.TempDir(), "links.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Admins are managed by hand, so add the rows the way an operator would.
+	if _, err := db.db.Exec(`INSERT INTO Admins (Name) VALUES ('Amelie@example.com')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO Admins (Name) VALUES ('group:Eng@example.com')`); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name   string
+		login  string
+		groups []string
+		want   bool
+	}{
+		{name: "listed user", login: "Amelie@example.com", want: true},
+		{name: "listed user, different case", login: "amelie@example.com", want: true},
+		{name: "unlisted user", login: "someone@example.com", want: false},
+		{name: "no login or groups", want: false},
+		{name: "listed group", login: "someone@example.com", groups: []string{"eng@example.com"}, want: true},
+		{name: "listed group among several", login: "someone@example.com", groups: []string{"sales@example.com", "ENG@example.com"}, want: true},
+		{name: "unlisted groups", login: "someone@example.com", groups: []string{"sales@example.com"}, want: false},
+		{name: "user listed, groups not", login: "amelie@example.com", groups: []string{"sales@example.com"}, want: true},
+		{name: "group named like the listed user", login: "someone@example.com", groups: []string{"amelie@example.com"}, want: false},
+		{name: "user named like the listed group", login: "eng@example.com", want: false},
+	}
+	for _, tt := range tests {
+		got, err := db.IsAdmin(tt.login, tt.groups)
+		if err != nil {
+			t.Errorf("%s: db.IsAdmin(%q, %q) returned error: %v", tt.name, tt.login, tt.groups, err)
+			continue
+		}
+		if got != tt.want {
+			t.Errorf("%s: db.IsAdmin(%q, %q) = %v, want %v", tt.name, tt.login, tt.groups, got, tt.want)
+		}
+	}
+
+	// The table is edited by hand, so it rejects a misspelled group prefix
+	// itself rather than silently keeping a row that can never match.
+	if _, err := db.db.Exec(`INSERT INTO Admins (Name) VALUES ('groups:eng@example.com')`); err == nil {
+		t.Error("inserting a row with a misspelled group prefix succeeded, want CHECK constraint failure")
+	}
+}
+
 // Test saving, loading, and deleting stats for SQLiteDB.
 func Test_SQLiteDB_SaveLoadDeleteStats(t *testing.T) {
 	db, err := NewSQLiteDB(path.Join(t.TempDir(), "links.db"))

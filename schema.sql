@@ -8,6 +8,18 @@ CREATE TABLE IF NOT EXISTS Links (
 	Locked   INTEGER NOT NULL DEFAULT 0    -- if 1, only Owner or an admin may edit
 );
 
+-- Admins is managed by the operator, directly in the database. golink only ever
+-- reads it; it grants admin rights in addition to any tailnet ACL grant.
+CREATE TABLE IF NOT EXISTS Admins (
+	-- a login, or "group:" followed by a group the user belongs to. NOCASE so
+	-- that the same name in a different case is the same row, however it was
+	-- typed in. A name containing a colon has to be a group, which catches a
+	-- misspelled prefix that would otherwise sit here matching nobody.
+	Name     TEXT    PRIMARY KEY COLLATE NOCASE
+	                 CHECK (Name NOT LIKE '%:%' OR Name LIKE 'group:%'),
+	Created  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')) -- unix seconds
+);
+
 CREATE TABLE IF NOT EXISTS Stats (
 	ID       TEXT    NOT NULL DEFAULT "",
 	Created  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), -- unix seconds

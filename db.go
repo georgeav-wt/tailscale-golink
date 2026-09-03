@@ -168,6 +168,42 @@ func (s *SQLiteDB) Delete(short string) error {
 	return nil
 }
 
+// adminGroupPrefix marks a row of the Admins table as naming a group rather
+// than a login, in the style of the "group:" prefix used in tailnet ACLs.
+const adminGroupPrefix = "group:"
+
+// IsAdmin returns whether the specified login, or any of the groups that login
+// belongs to, is listed in the Admins table.
+//
+// The table is managed by the operator, directly in the database; golink never
+// writes to it. It is empty by default, in which case admin rights come only
+// from the tailnet ACL grant, as they always have.
+func (s *SQLiteDB) IsAdmin(login string, groups []string) (bool, error) {
+	// The names that would make this user an admin, if any of them is listed.
+	var names []any
+	if login != "" {
+		names = append(names, strings.ToLower(login))
+	}
+	for _, group := range groups {
+		if group != "" {
+			names = append(names, adminGroupPrefix+strings.ToLower(group))
+		}
+	}
+	if len(names) == 0 {
+		return false, nil
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var count int
+	query := "SELECT count(*) FROM Admins WHERE LOWER(Name) IN (?" + strings.Repeat(", ?", len(names)-1) + ")"
+	if err := s.db.QueryRow(query, names...).Scan(&count); err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 // LoadStats returns click stats for links.
 func (s *SQLiteDB) LoadStats() (ClickStats, error) {
 	allLinks, err := s.LoadAll()

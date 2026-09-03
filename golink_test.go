@@ -490,6 +490,62 @@ func TestServeSaveLock(t *testing.T) {
 	}
 }
 
+// TestAdminsTable tests that a login listed in the Admins table is treated as
+// an admin, which otherwise only a tailnet ACL grant can confer. It runs
+// without -open-links, where admin rights are the only way to edit a link
+// belonging to somebody else.
+func TestAdminsTable(t *testing.T) {
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Save(&Link{Short: "lk", Long: "/before", Owner: "foo@example.com"})
+	if _, err := db.db.Exec(`INSERT INTO Admins (Name) VALUES ('admin@example.com')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`INSERT INTO Admins (Name) VALUES ('group:admins@example.com')`); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		login      string
+		groups     []string
+		wantStatus int
+	}{
+		{name: "login absent from the table", login: "bar@example.com", wantStatus: http.StatusForbidden},
+		{name: "login present in the table", login: "admin@example.com", wantStatus: http.StatusOK},
+		{name: "group absent from the table", login: "bar@example.com", groups: []string{"sales@example.com"}, wantStatus: http.StatusForbidden},
+		{name: "group present in the table", login: "bar@example.com", groups: []string{"admins@example.com"}, wantStatus: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldCurrentUser := currentUser
+			currentUser = func(*http.Request) (user, error) {
+				return user{login: tt.login, groups: tt.groups}, nil
+			}
+			t.Cleanup(func() { currentUser = oldCurrentUser })
+
+			form := url.Values{
+				"short": {"lk"},
+				"long":  {"/after"},
+				"owner": {"foo@example.com"},
+				"xsrf":  {xsrftoken.Generate(xsrfKey, tt.login, "lk")},
+			}
+			r := httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			w := httptest.NewRecorder()
+			serveSave(w, r)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("serveSave as %q in %q = %d (%s); want %d", tt.login, tt.groups, w.Code, w.Body.String(), tt.wantStatus)
+			}
+		})
+	}
+}
+
 func TestCanLockLink(t *testing.T) {
 	var (
 		link  = &Link{Short: "a", Owner: "foo@example.com"}

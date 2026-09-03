@@ -601,7 +601,7 @@ func serveHome(w http.ResponseWriter, r *http.Request, short string) {
 		}
 	}
 
-	cu, err := currentUser(r)
+	cu, err := requestUser(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -695,7 +695,7 @@ func serveGo(w http.ResponseWriter, r *http.Request) {
 	stats.dirty[link.Short]++
 	stats.mu.Unlock()
 
-	cu, _ := currentUser(r)
+	cu, _ := requestUser(r)
 	env := expandEnv{Now: time.Now().UTC(), Path: remainder, user: cu.login, query: r.URL.Query()}
 	target, err := expandLink(link.Long, env)
 	if err != nil {
@@ -758,7 +758,7 @@ func serveDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cu, err := currentUser(r)
+	cu, err := requestUser(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -896,6 +896,9 @@ type capabilities struct {
 type user struct {
 	login   string
 	isAdmin bool
+	// groups the user belongs to, if the identity source reports any. WhoIs
+	// does not, so this is only populated for identity sources that do.
+	groups []string
 }
 
 // currentUser returns the Tailscale user associated with the request.
@@ -994,6 +997,25 @@ var extractUserFromHeaders = func(r *http.Request) user {
 	return user{}
 }
 
+// requestUser returns the user making the request: whoever currentUser reports,
+// plus admin rights held by their login or by one of their groups in the Admins
+// table. The table is an additional source of admins alongside the tailnet ACL
+// grant, and grants nothing until an operator adds rows to it.
+func requestUser(r *http.Request) (user, error) {
+	u, err := currentUser(r)
+	if err != nil || u.isAdmin || (u.login == "" && len(u.groups) == 0) {
+		return u, err
+	}
+	admin, err := db.IsAdmin(u.login, u.groups)
+	if err != nil {
+		// Fail closed: a user we cannot confirm to be an admin is not one.
+		log.Printf("looking up admin %q: %v", u.login, err)
+		return u, nil
+	}
+	u.isAdmin = admin
+	return u, nil
+}
+
 // whoisFunc is a variable so it can be overridden in tests. By default, it calls localClient.WhoIs.
 var whoisFunc = func(ctx context.Context, ip string) (*apitype.WhoIsResponse, error) {
 	return localClient.WhoIs(ctx, ip)
@@ -1039,7 +1061,7 @@ func serveDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cu, err := currentUser(r)
+	cu, err := requestUser(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1101,7 +1123,7 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	cu, err := currentUser(r)
+	cu, err := requestUser(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

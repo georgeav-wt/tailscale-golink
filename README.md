@@ -311,6 +311,29 @@ you could assign the grant to `autogroup:member`:
 
 [ACL grants]: https://tailscale.com/kb/1324/acl-grants
 
+Admins can also be listed in the `Admins` table of the SQLite database, which is
+useful when the tailnet policy file is not where you want to manage them.
+golink only ever reads that table; add and remove admins with `sqlite3`:
+
+```sh
+sqlite3 golink.db "INSERT INTO Admins (Name) VALUES ('amelie@example.com');"
+sqlite3 golink.db "INSERT INTO Admins (Name) VALUES ('group:eng@example.com');"
+sqlite3 golink.db "SELECT Name FROM Admins;"
+sqlite3 golink.db "DELETE FROM Admins WHERE Name = 'amelie@example.com';"
+```
+
+A row names either a user, by login, or a group the user belongs to, written
+with a `group:` prefix as in a tailnet ACL. A group row only ever matches if
+golink's identity source reports group membership; the tailnet identity it uses
+by default reports none, so group rows are for deployments that authenticate
+users some other way.
+
+Names are matched case-insensitively, and each request consults the table, so
+changes take effect immediately without restarting golink. Anyone listed there
+is an admin in addition to anyone granted admin by an ACL grant; an empty table
+grants nothing. Note that the table is not part of a `/.export` snapshot, so
+back it up separately.
+
 ## Backups
 
 Once you have golink running, you can back up all of your links in [JSON lines] format from <http://go/.export>.
