@@ -24,6 +24,16 @@
       <label for=owner class="text-sm font-bold block mt-4">Owner</label>
       <input id=owner name=owner required type=text size=25 placeholder="Owner" value="{{.Link.Owner}}" class="p-2 rounded-md border-gray-300 placeholder:text-gray-400 disabled:bg-gray-100">
 
+      {{ if .Lockable }}
+      <input type=hidden name=lockedset value="1" />
+      <label for=locked class="flex items-center mt-4">
+        <input id=locked name=locked type=checkbox value="1" {{ if .Link.Locked }}checked{{ end }} class="mr-2 border-gray-300">
+        <span class="text-sm">Lock this link, so that only its owner or an admin can change it</span>
+      </label>
+      {{ else if .Link.Locked }}
+      <p class="text-sm text-gray-500 mt-4">This link is locked, so only you and admins can change it. Ask an admin to unlock it.</p>
+      {{ end }}
+
       <dl>
         <dt class="text-sm font-bold mt-6">Date Created</dt>
         <dd>{{.Link.Created.Format "Jan _2, 2006 3:04pm MST"}}</dd>
@@ -51,7 +61,7 @@
       <dd>{{.Link.Long}}</dd>
 
       <dt class="text-sm font-bold mt-6">Owner</dt>
-      <dd>{{.Link.Owner}}</dd>
+      <dd>{{.Link.Owner}}{{ if .Link.Locked }} (locked; only the owner or an admin can change this link){{ end }}</dd>
 
       <dt class="text-sm font-bold mt-6">Date Created</dt>
       <dd>{{.Link.Created.Format "Jan _2, 2006 3:04pm MST"}}</dd>

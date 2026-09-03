@@ -267,6 +267,13 @@ Ownership can be transferred to another user from the link edit page.
 Links whose owner is no longer part of the tailnet can be edited by any user,
 at which point that user will become the new owner.
 
+Start golink with `-open-links` to invert that default: any user can then update
+or delete any link, and editing a link no longer changes who owns it.
+A link's owner (or an admin) can *lock* the link from its detail page, which
+restores the default behavior for that link alone -- only its owner and admins
+can update, delete, or unlock it. The lock checkbox is only shown, and only has
+any effect, when running with `-open-links`.
+
 Users can be granted admin access to edit all links using [ACL grants] in your tailnet policy file.
 For example, if you have your golink instance tagged with `tag:golink` and a user group named `group:golink-admins`,
 you can grant them admin access using:

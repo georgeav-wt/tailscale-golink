@@ -184,6 +184,8 @@ func TestServeSave(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices"})
+	db.Save(&Link{Short: "locked-link", Long: "/before", Owner: "foo@example.com", Locked: true})
+	db.Save(&Link{Short: "lockme", Long: "/before", Owner: "foo@example.com"})
 
 	fooXSRF := func(short string) string {
 		return xsrftoken.Generate(xsrfKey, "foo@example.com", short)
@@ -197,6 +199,10 @@ func TestServeSave(t *testing.T) {
 		short             string
 		xsrf              string
 		long              string
+		lockedset         bool // whether to submit the lock state at all
+		locked            bool // the lock state to submit
+		openLinks         bool
+		ownerCanLock      bool
 		allowUnknownUsers bool
 		currentUser       func(*http.Request) (user, error)
 		wantStatus        int
@@ -226,6 +232,96 @@ func TestServeSave(t *testing.T) {
 			short:       "who",
 			xsrf:        barXSRF("who"),
 			long:        "http://who/",
+			currentUser: func(*http.Request) (user, error) { return user{login: "bar@example.com"}, nil },
+			wantStatus:  http.StatusForbidden,
+		},
+		{
+			name:        "open links: allow editing another's unlocked link",
+			short:       "who",
+			xsrf:        barXSRF("who"),
+			long:        "http://who/",
+			openLinks:   true,
+			currentUser: func(*http.Request) (user, error) { return user{login: "bar@example.com"}, nil },
+			wantStatus:  http.StatusOK,
+		},
+		{
+			name:        "open links: disallow editing another's locked link",
+			short:       "locked-link",
+			xsrf:        barXSRF("locked-link"),
+			long:        "/after",
+			openLinks:   true,
+			currentUser: func(*http.Request) (user, error) { return user{login: "bar@example.com"}, nil },
+			wantStatus:  http.StatusForbidden,
+		},
+		{
+			name:       "open links: allow owner to edit their own locked link",
+			short:      "locked-link",
+			xsrf:       fooXSRF("locked-link"),
+			long:       "/after",
+			openLinks:  true,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:        "open links: allow admin to edit another's locked link",
+			short:       "locked-link",
+			xsrf:        barXSRF("locked-link"),
+			long:        "/after",
+			openLinks:   true,
+			currentUser: func(*http.Request) (user, error) { return user{login: "bar@example.com", isAdmin: true}, nil },
+			wantStatus:  http.StatusOK,
+		},
+		{
+			// Locking is an admin decision, so its owner cannot.
+			name:       "open links: disallow the owner from locking a link",
+			short:      "lockme",
+			xsrf:       fooXSRF("lockme"),
+			long:       "/after",
+			openLinks:  true,
+			lockedset:  true,
+			locked:     true,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:         "owner can lock: allow the owner to lock a link",
+			short:        "lockme",
+			xsrf:         fooXSRF("lockme"),
+			long:         "/after",
+			openLinks:    true,
+			ownerCanLock: true,
+			lockedset:    true,
+			locked:       true,
+			wantStatus:   http.StatusOK,
+		},
+		{
+			name:        "open links: allow an admin to unlock a link",
+			short:       "lockme",
+			xsrf:        barXSRF("lockme"),
+			long:        "/after",
+			openLinks:   true,
+			lockedset:   true,
+			currentUser: func(*http.Request) (user, error) { return user{login: "bar@example.com", isAdmin: true}, nil },
+			wantStatus:  http.StatusOK,
+		},
+		{
+			// A new link cannot be born locked either, or the rule would only
+			// hold for links that already exist.
+			name:       "open links: disallow creating a link already locked",
+			short:      "born-locked",
+			xsrf:       fooXSRF(newShortName),
+			long:       "/x",
+			openLinks:  true,
+			lockedset:  true,
+			locked:     true,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:        "open links: disallow non-owner from locking a link",
+			short:       "who",
+			xsrf:        barXSRF("who"),
+			long:        "http://who/",
+			openLinks:   true,
+			lockedset:   true,
+			locked:      true,
 			currentUser: func(*http.Request) (user, error) { return user{login: "bar@example.com"}, nil },
 			wantStatus:  http.StatusForbidden,
 		},
@@ -293,11 +389,22 @@ func TestServeSave(t *testing.T) {
 			*allowUnknownUsers = tt.allowUnknownUsers
 			t.Cleanup(func() { *allowUnknownUsers = oldAllowUnknownUsers })
 
-			r := httptest.NewRequest("POST", "/", strings.NewReader(url.Values{
+			oldOpenLinks, oldOwnerCanLock := *openLinks, *ownerCanLock
+			*openLinks, *ownerCanLock = tt.openLinks, tt.ownerCanLock
+			t.Cleanup(func() { *openLinks, *ownerCanLock = oldOpenLinks, oldOwnerCanLock })
+
+			form := url.Values{
 				"short": {tt.short},
 				"long":  {tt.long},
 				"xsrf":  {tt.xsrf},
-			}.Encode()))
+			}
+			if tt.lockedset {
+				form.Set("lockedset", "1")
+				if tt.locked {
+					form.Set("locked", "1")
+				}
+			}
+			r := httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
 			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 			w := httptest.NewRecorder()
 			serveSave(w, r)
@@ -314,6 +421,182 @@ func TestServeSave(t *testing.T) {
 	}
 }
 
+// TestServeSaveLock tests that a link's lock is only changed when a request
+// explicitly says so, and that editing a link does not take ownership of it.
+// Who is allowed to change a lock is TestCanLockLink's business; this runs with
+// -owner-can-lock so that the owner can drive it.
+func TestServeSaveLock(t *testing.T) {
+	oldOpenLinks, oldOwnerCanLock := *openLinks, *ownerCanLock
+	*openLinks, *ownerCanLock = true, true
+	t.Cleanup(func() { *openLinks, *ownerCanLock = oldOpenLinks, oldOwnerCanLock })
+
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Save(&Link{Short: "lk", Long: "/before", Owner: "foo@example.com"})
+
+	save := func(t *testing.T, form url.Values, cu user) {
+		t.Helper()
+		oldCurrentUser := currentUser
+		currentUser = func(*http.Request) (user, error) { return cu, nil }
+		t.Cleanup(func() { currentUser = oldCurrentUser })
+
+		form.Set("xsrf", xsrftoken.Generate(xsrfKey, cu.login, form.Get("short")))
+		r := httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		serveSave(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("serveSave(%v) = %d (%s); want 200", form, w.Code, w.Body.String())
+		}
+	}
+	load := func(t *testing.T) *Link {
+		t.Helper()
+		link, err := db.Load("lk")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return link
+	}
+
+	foo := user{login: "foo@example.com"}
+	bar := user{login: "bar@example.com"}
+
+	// The owner locks the link.
+	save(t, url.Values{"short": {"lk"}, "long": {"/after"}, "lockedset": {"1"}, "locked": {"1"}}, foo)
+	if link := load(t); !link.Locked {
+		t.Error("link not locked after saving with locked=1")
+	}
+
+	// A request that says nothing about the lock leaves it alone.
+	save(t, url.Values{"short": {"lk"}, "long": {"/after2"}}, foo)
+	if link := load(t); !link.Locked {
+		t.Error("link unlocked by a request that did not set lockedset")
+	}
+
+	// The owner unlocks the link. An unchecked checkbox submits no value at
+	// all, so only lockedset is present.
+	save(t, url.Values{"short": {"lk"}, "long": {"/after3"}, "lockedset": {"1"}}, foo)
+	if link := load(t); link.Locked {
+		t.Error("link still locked after saving with lockedset and no locked")
+	}
+
+	// Another user may now edit the link, but does not become its owner.
+	save(t, url.Values{"short": {"lk"}, "long": {"/after4"}}, bar)
+	if link := load(t); link.Owner != "foo@example.com" {
+		t.Errorf("link owner = %q after edit by another user; want foo@example.com", link.Owner)
+	}
+}
+
+func TestCanLockLink(t *testing.T) {
+	var (
+		link  = &Link{Short: "a", Owner: "foo@example.com"}
+		owner = user{login: "foo@example.com"}
+		other = user{login: "bar@example.com"}
+		admin = user{login: "bar@example.com", isAdmin: true}
+	)
+
+	tests := []struct {
+		name         string
+		link         *Link
+		user         user
+		openLinks    bool
+		ownerCanLock bool
+		want         bool
+	}{
+		// Locking is an admin decision by default.
+		{name: "admin", link: link, user: admin, openLinks: true, want: true},
+		{name: "owner", link: link, user: owner, openLinks: true, want: false},
+		{name: "anybody else", link: link, user: other, openLinks: true, want: false},
+		{name: "a link being created", link: nil, user: owner, openLinks: true, want: false},
+		{name: "a link being created, by an admin", link: nil, user: admin, openLinks: true, want: true},
+
+		// With -owner-can-lock the owner may do it too, and still nobody else.
+		{name: "owner can lock: admin", link: link, user: admin, openLinks: true, ownerCanLock: true, want: true},
+		{name: "owner can lock: owner", link: link, user: owner, openLinks: true, ownerCanLock: true, want: true},
+		{name: "owner can lock: anybody else", link: link, user: other, openLinks: true, ownerCanLock: true, want: false},
+
+		// A lock says nothing that is not already true without -open-links.
+		{name: "no open links: admin", link: link, user: admin, want: false},
+		{name: "no open links: owner", link: link, user: owner, ownerCanLock: true, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldOpenLinks, oldOwnerCanLock := *openLinks, *ownerCanLock
+			*openLinks, *ownerCanLock = tt.openLinks, tt.ownerCanLock
+			t.Cleanup(func() { *openLinks, *ownerCanLock = oldOpenLinks, oldOwnerCanLock })
+
+			if got := canLockLink(tt.link, tt.user); got != tt.want {
+				t.Errorf("canLockLink(%v, %v) = %v; want %v", tt.link, tt.user, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCanEditLink(t *testing.T) {
+	var (
+		unlocked = &Link{Short: "a", Owner: "foo@example.com"}
+		locked   = &Link{Short: "b", Owner: "foo@example.com", Locked: true}
+		unowned  = &Link{Short: "c"}
+
+		owner = user{login: "foo@example.com"}
+		other = user{login: "bar@example.com"}
+		admin = user{login: "bar@example.com", isAdmin: true}
+	)
+
+	tests := []struct {
+		name      string
+		link      *Link
+		user      user
+		openLinks bool
+		readonly  bool
+		want      bool
+	}{
+		// The default permission model: a link belongs to its owner. Tests run
+		// in dev mode, where userExists always reports that the owner exists.
+		{name: "new link", link: nil, user: other, want: true},
+		{name: "unowned link", link: unowned, user: other, want: true},
+		{name: "another user's link", link: unlocked, user: other, want: false},
+		{name: "another user's link, admin", link: unlocked, user: admin, want: true},
+		{name: "own link", link: unlocked, user: owner, want: true},
+
+		// With -open-links, only a locked link belongs to its owner.
+		{name: "open links: new link", link: nil, user: other, openLinks: true, want: true},
+		{name: "open links: unowned link", link: unowned, user: other, openLinks: true, want: true},
+		{name: "open links: another user's unlocked link", link: unlocked, user: other, openLinks: true, want: true},
+		{name: "open links: own unlocked link", link: unlocked, user: owner, openLinks: true, want: true},
+		{name: "open links: another user's locked link", link: locked, user: other, openLinks: true, want: false},
+		{name: "open links: own locked link", link: locked, user: owner, openLinks: true, want: true},
+		{name: "open links: another user's locked link, admin", link: locked, user: admin, openLinks: true, want: true},
+
+		// Read-only mode refuses every edit, in either model.
+		{name: "readonly, own link", link: unlocked, user: owner, readonly: true, want: false},
+		{name: "readonly, admin", link: unlocked, user: admin, readonly: true, want: false},
+		{name: "readonly, new link", link: nil, user: owner, readonly: true, want: false},
+		{name: "readonly, open links, unlocked link", link: unlocked, user: other, openLinks: true, readonly: true, want: false},
+		{name: "readonly, open links, own link", link: unlocked, user: owner, openLinks: true, readonly: true, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldReadonly := *readonly
+			*readonly = tt.readonly
+			t.Cleanup(func() { *readonly = oldReadonly })
+
+			oldOpenLinks := *openLinks
+			*openLinks = tt.openLinks
+			t.Cleanup(func() { *openLinks = oldOpenLinks })
+
+			if got := canEditLink(context.Background(), tt.link, tt.user); got != tt.want {
+				t.Errorf("canEditLink(%v, %v) = %v; want %v", tt.link, tt.user, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestServeDelete(t *testing.T) {
 	var err error
 	db, err = NewSQLiteDB(":memory:")
@@ -323,6 +606,9 @@ func TestServeDelete(t *testing.T) {
 	db.Save(&Link{Short: "a", Owner: "a@example.com"})
 	db.Save(&Link{Short: "foo", Owner: "foo@example.com"})
 	db.Save(&Link{Short: "link-owned-by-tagged-devices", Long: "/before", Owner: "tagged-devices"})
+	db.Save(&Link{Short: "b", Owner: "a@example.com"})
+	db.Save(&Link{Short: "locked-link", Owner: "a@example.com", Locked: true})
+	db.Save(&Link{Short: "locked-link2", Owner: "a@example.com", Locked: true})
 
 	xsrf := func(short string) string {
 		return xsrftoken.Generate(xsrfKey, "foo@example.com", short)
@@ -332,6 +618,7 @@ func TestServeDelete(t *testing.T) {
 		name        string
 		short       string
 		xsrf        string
+		openLinks   bool
 		currentUser func(*http.Request) (user, error)
 		wantStatus  int
 	}{
@@ -346,9 +633,31 @@ func TestServeDelete(t *testing.T) {
 			wantStatus: http.StatusNotFound,
 		},
 		{
-			name:       "unowned link",
+			name:       "another user's link",
 			short:      "a",
 			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:       "open links: another user's unlocked link",
+			short:      "b",
+			xsrf:       xsrf("b"),
+			openLinks:  true,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "open links: another user's locked link",
+			short:      "locked-link",
+			xsrf:       xsrf("locked-link"),
+			openLinks:  true,
+			wantStatus: http.StatusForbidden,
+		},
+		{
+			name:        "open links: admin can delete another user's locked link",
+			short:       "locked-link2",
+			xsrf:        xsrf("locked-link2"),
+			openLinks:   true,
+			currentUser: func(*http.Request) (user, error) { return user{login: "foo@example.com", isAdmin: true}, nil },
+			wantStatus:  http.StatusOK,
 		},
 		{
 			name:       "allow deleting link owned by tagged-devices",
@@ -357,7 +666,7 @@ func TestServeDelete(t *testing.T) {
 			wantStatus: http.StatusOK,
 		},
 		{
-			name:        "admin can delete unowned link",
+			name:        "admin can delete another user's link",
 			short:       "a",
 			currentUser: func(*http.Request) (user, error) { return user{login: "foo@example.com", isAdmin: true}, nil },
 			xsrf:        xsrf("a"),
@@ -386,6 +695,10 @@ func TestServeDelete(t *testing.T) {
 					currentUser = oldCurrentUser
 				})
 			}
+
+			oldOpenLinks := *openLinks
+			*openLinks = tt.openLinks
+			t.Cleanup(func() { *openLinks = oldOpenLinks })
 
 			r := httptest.NewRequest("POST", "/.delete/"+tt.short, strings.NewReader(url.Values{
 				"xsrf": {tt.xsrf},

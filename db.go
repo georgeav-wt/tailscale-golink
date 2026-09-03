@@ -26,6 +26,10 @@ type Link struct {
 	Created  time.Time
 	LastEdit time.Time // when the link was last edited
 	Owner    string    // user@domain
+	// Locked reports whether only Owner and admins may edit the link.
+	// It is omitted when exporting unlocked links, so that snapshots of
+	// databases without any locked links are unchanged.
+	Locked bool `json:",omitempty"`
 }
 
 // ClickStats is the number of clicks a set of links have received in a given
@@ -80,14 +84,14 @@ func (s *SQLiteDB) LoadAll() ([]*Link, error) {
 	defer s.mu.RUnlock()
 
 	var links []*Link
-	rows, err := s.db.Query("SELECT Short, Long, Created, LastEdit, Owner FROM Links")
+	rows, err := s.db.Query("SELECT Short, Long, Created, LastEdit, Owner, Locked FROM Links")
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		link := new(Link)
 		var created, lastEdit int64
-		err := rows.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner)
+		err := rows.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner, &link.Locked)
 		if err != nil {
 			return nil, err
 		}
@@ -109,8 +113,8 @@ func (s *SQLiteDB) Load(short string) (*Link, error) {
 
 	link := new(Link)
 	var created, lastEdit int64
-	row := s.db.QueryRow("SELECT Short, Long, Created, LastEdit, Owner FROM Links WHERE ID = ?1 LIMIT 1", linkID(short))
-	err := row.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner)
+	row := s.db.QueryRow("SELECT Short, Long, Created, LastEdit, Owner, Locked FROM Links WHERE ID = ?1 LIMIT 1", linkID(short))
+	err := row.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner, &link.Locked)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = fs.ErrNotExist
@@ -127,7 +131,11 @@ func (s *SQLiteDB) Save(link *Link) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Created, LastEdit, Owner) VALUES (?, ?, ?, ?, ?, ?)", linkID(link.Short), link.Short, link.Long, link.Created.Unix(), link.LastEdit.Unix(), link.Owner)
+	locked := 0
+	if link.Locked {
+		locked = 1
+	}
+	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Created, LastEdit, Owner, Locked) VALUES (?, ?, ?, ?, ?, ?, ?)", linkID(link.Short), link.Short, link.Long, link.Created.Unix(), link.LastEdit.Unix(), link.Owner, locked)
 	if err != nil {
 		return err
 	}
@@ -232,14 +240,14 @@ func (s *SQLiteDB) GetLinksByOwner(owner string) ([]*Link, error) {
 	defer s.mu.RUnlock()
 
 	var links []*Link
-	rows, err := s.db.Query("SELECT Short, Long, Created, LastEdit, Owner FROM Links WHERE LOWER(Owner) = LOWER(?)", owner)
+	rows, err := s.db.Query("SELECT Short, Long, Created, LastEdit, Owner, Locked FROM Links WHERE LOWER(Owner) = LOWER(?)", owner)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		link := new(Link)
 		var created, lastEdit int64
-		err := rows.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner)
+		err := rows.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner, &link.Locked)
 		if err != nil {
 			return nil, err
 		}

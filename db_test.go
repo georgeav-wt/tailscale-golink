@@ -21,6 +21,7 @@ func Test_SQLiteDB_SaveLoadDeleteLinks(t *testing.T) {
 	links := []*Link{
 		{Short: "short", Long: "long"},
 		{Short: "Foo.Bar", Long: "long"},
+		{Short: "locked", Long: "long", Owner: "a@example.com", Locked: true},
 	}
 
 	for _, link := range links {

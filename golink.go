@@ -70,6 +70,8 @@ var (
 	resolveFromBackup = flag.String("resolve-from-backup", "", "resolve a link from snapshot file and exit")
 	allowUnknownUsers = flag.Bool("allow-unknown-users", false, "allow unknown users to save links")
 	readonly          = flag.Bool("readonly", false, "start golink server in read-only mode")
+	openLinks         = flag.Bool("open-links", false, "allow any user to edit any link that its owner has not locked")
+	ownerCanLock      = flag.Bool("owner-can-lock", false, "let the owner of a link lock it, as well as an admin; only meaningful with -open-links")
 	advertiseTags     = flag.String("advertise-tags", os.Getenv("TS_ADVERTISE_TAGS"), "comma-separated list of ACL tags to advertise (e.g. tag:golink)")
 	serviceName       = flag.String("register-as-service", envknob.String("TS_SERVICE_NAME"), "register as a Tailscale Service (e.g., svc:golink); requires tagged node")
 )
@@ -720,7 +722,10 @@ func acceptHTML(r *http.Request) bool {
 // detailData is the data used by the detailTmpl template.
 type detailData struct {
 	// Editable indicates whether the current user can edit the link.
-	Editable      bool
+	Editable bool
+	// Lockable indicates whether the current user can change whether the link
+	// is locked.
+	Lockable      bool
 	Link          *Link
 	XSRF          string
 	AlreadyExists bool
@@ -767,6 +772,7 @@ func serveDetail(w http.ResponseWriter, r *http.Request) {
 	data := detailData{
 		Link:     link,
 		Editable: canEdit,
+		Lockable: canEdit && canLockLink(link, cu),
 		XSRF:     xsrftoken.Generate(xsrfKey, cu.login, link.Short),
 	}
 	if r.URL.Query().Get("exists") == "1" {
@@ -1112,6 +1118,12 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The lock is only updated if the request explicitly says so, so that
+	// clients that know nothing about it (the home page create form, the API)
+	// leave an existing link's lock alone.
+	setLocked := *openLinks && r.FormValue("lockedset") != ""
+	locked := r.FormValue("locked") != ""
+
 	// short name to use for XSRF token.
 	// For new link creation, the special newShortName value is used.
 	// For existing links, the link's short name is used. This intentionally
@@ -1135,7 +1147,9 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// allow transferring ownership to valid users. If empty, set owner to current user.
+	// allow transferring ownership to valid users. If empty, set owner to
+	// current user. With -open-links, keep the existing owner instead: editing
+	// someone else's link is normal there, and should not take it from them.
 	owner := r.FormValue("owner")
 	if owner != "" {
 		exists, err := userExists(r.Context(), owner)
@@ -1146,23 +1160,46 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "new owner not a valid user: "+owner, http.StatusBadRequest)
 			return
 		}
+	} else if *openLinks && link != nil && link.Owner != "" {
+		owner = link.Owner
 	} else {
 		owner = cu.login
 	}
 
 	now := time.Now().UTC()
 	newLink := false
+	// The link is edited in place below, so keep a copy of what it looked
+	// like before: the owner it has now is whose permission a lock needs.
+	var previous *Link
 	if link == nil {
 		link = &Link{
 			Short:   short,
 			Created: now,
 		}
 		newLink = true
+	} else {
+		before := *link
+		previous = &before
 	}
 	link.Short = short
 	link.Long = long
 	link.LastEdit = now
 	link.Owner = owner
+	if setLocked && locked != link.Locked {
+		// Whose permission this needs is the owner the link has now, not the
+		// one it is being given: transferring a link away does not hand over
+		// the right to lock it on the way out. A link being created has no
+		// previous owner, so the one it is about to get decides.
+		subject := link
+		if previous != nil {
+			subject = previous
+		}
+		if !canLockLink(subject, cu) {
+			http.Error(w, lockRefusal(subject), http.StatusForbidden)
+			return
+		}
+		link.Locked = locked
+	}
 	if err := db.Save(link); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1183,6 +1220,8 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 // canEditLink returns whether the specified user has permission to edit link.
 // Admin users can edit all links.
 // Non-admin users can only edit their own links or links without an active owner.
+// If -open-links is set, any user can also edit any link that its owner has
+// not locked.
 func canEditLink(ctx context.Context, link *Link, u user) bool {
 	if *readonly {
 		return false
@@ -1192,8 +1231,12 @@ func canEditLink(ctx context.Context, link *Link, u user) bool {
 		return true
 	}
 
-	if u.isAdmin || link.Owner == u.login {
+	if ownsLink(link, u) {
 		return true
+	}
+
+	if *openLinks {
+		return !link.Locked
 	}
 
 	owned, err := userExists(ctx, link.Owner)
@@ -1202,6 +1245,41 @@ func canEditLink(ctx context.Context, link *Link, u user) bool {
 	}
 	// Allow editing if the link is currently unowned
 	return err == nil && !owned
+}
+
+// ownsLink returns whether the specified user owns link, either as its owner
+// or as an admin.
+func ownsLink(link *Link, u user) bool {
+	return u.isAdmin || (link != nil && link.Owner == u.login)
+}
+
+// canLockLink returns whether the specified user has permission to change
+// link's locked state.
+//
+// Locking is an admin decision: it takes a link out of the model that
+// -open-links puts every other link into, so it does not belong to whoever
+// happened to create the link first. With -owner-can-lock the link's owner may
+// do it as well.
+//
+// Without -open-links nobody can, because a lock would say nothing that is not
+// already true: every link is its owner's alone in that mode.
+func canLockLink(link *Link, u user) bool {
+	if !*openLinks {
+		return false
+	}
+	if u.isAdmin {
+		return true
+	}
+	return *ownerCanLock && link != nil && link.Owner == u.login
+}
+
+// lockRefusal explains who could have changed a lock that the current user
+// could not.
+func lockRefusal(link *Link) string {
+	if *ownerCanLock && link != nil && link.Owner != "" {
+		return fmt.Sprintf("only %q or an admin can lock this link", link.Owner)
+	}
+	return "only an admin can lock a link"
 }
 
 // serveExport prints a snapshot of the link database. Links are JSON encoded
