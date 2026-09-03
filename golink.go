@@ -72,6 +72,8 @@ var (
 	readonly          = flag.Bool("readonly", false, "start golink server in read-only mode")
 	openLinks         = flag.Bool("open-links", false, "allow any user to edit any link that its owner has not locked")
 	ownerCanLock      = flag.Bool("owner-can-lock", false, "let the owner of a link lock it, as well as an admin; only meaningful with -open-links")
+	authEmailHeader   = flag.String("auth-email-header", "", `if non-empty, identify users by this HTTP header, set by an authenticating proxy in front of golink (e.g. "X-Auth-Request-Email"), rather than by their tailnet identity`)
+	authGroupsHeader  = flag.String("auth-groups-header", "", `HTTP header holding the comma-separated groups a user belongs to (e.g. "X-Auth-Request-Groups"); only read when -auth-email-header is set`)
 	advertiseTags     = flag.String("advertise-tags", os.Getenv("TS_ADVERTISE_TAGS"), "comma-separated list of ACL tags to advertise (e.g. tag:golink)")
 	serviceName       = flag.String("register-as-service", envknob.String("TS_SERVICE_NAME"), "register as a Tailscale Service (e.g., svc:golink); requires tagged node")
 )
@@ -121,6 +123,11 @@ var localClient *local.Client
 
 func Run() error {
 	flag.Parse()
+
+	if *authEmailHeader != "" {
+		// Identity comes from a proxy in front of golink, not from the tailnet.
+		currentUser = proxyUser
+	}
 
 	hostinfo.SetApp("golink")
 
@@ -995,6 +1002,39 @@ var extractUserFromHeaders = func(r *http.Request) user {
 		return user{login: tsLogin}
 	}
 	return user{}
+}
+
+// proxyUser returns the user identified by the headers that an authenticating
+// proxy in front of golink sets. Run sets it as currentUser when
+// -auth-email-header is given.
+//
+// golink cannot distinguish a header set by that proxy from one set by whoever
+// made the request, so this is only safe where nothing but the proxy can reach
+// golink, and the proxy sets the headers on every request it forwards rather
+// than passing through what it was given.
+func proxyUser(r *http.Request) (user, error) {
+	login := strings.TrimSpace(r.Header.Get(*authEmailHeader))
+	if login == "" {
+		if *allowUnknownUsers {
+			// Don't report the error if we are allowing unknown users.
+			return user{}, nil
+		}
+		return user{}, fmt.Errorf("no %s header: golink was reached without going through the authenticating proxy, or the proxy is not configured to set it", *authEmailHeader)
+	}
+
+	u := user{login: login}
+	if *authGroupsHeader != "" {
+		// Proxies differ on whether they send one comma-separated header or
+		// repeat the header per group, so accept either.
+		for _, value := range r.Header.Values(*authGroupsHeader) {
+			for _, group := range strings.Split(value, ",") {
+				if group = strings.TrimSpace(group); group != "" {
+					u.groups = append(u.groups, group)
+				}
+			}
+		}
+	}
+	return u, nil
 }
 
 // requestUser returns the user making the request: whoever currentUser reports,

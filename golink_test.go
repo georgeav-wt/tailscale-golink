@@ -546,6 +546,165 @@ func TestAdminsTable(t *testing.T) {
 	}
 }
 
+func TestProxyUser(t *testing.T) {
+	tests := []struct {
+		name              string
+		emailHeader       string
+		groupsHeader      string
+		headers           map[string][]string
+		allowUnknownUsers bool
+		want              user
+		wantErr           bool
+	}{
+		{
+			name:        "email header",
+			emailHeader: "X-Auth-Request-Email",
+			headers:     map[string][]string{"X-Auth-Request-Email": {"amelie@example.com"}},
+			want:        user{login: "amelie@example.com"},
+		},
+		{
+			name:         "email and groups headers",
+			emailHeader:  "X-Auth-Request-Email",
+			groupsHeader: "X-Auth-Request-Groups",
+			headers: map[string][]string{
+				"X-Auth-Request-Email":  {"amelie@example.com"},
+				"X-Auth-Request-Groups": {"eng@example.com,admins@example.com"},
+			},
+			want: user{login: "amelie@example.com", groups: []string{"eng@example.com", "admins@example.com"}},
+		},
+		{
+			name:         "groups header with spaces and empty entries",
+			emailHeader:  "X-Auth-Request-Email",
+			groupsHeader: "X-Auth-Request-Groups",
+			headers: map[string][]string{
+				"X-Auth-Request-Email":  {" amelie@example.com "},
+				"X-Auth-Request-Groups": {" eng@example.com , , admins@example.com "},
+			},
+			want: user{login: "amelie@example.com", groups: []string{"eng@example.com", "admins@example.com"}},
+		},
+		{
+			name:         "groups header not sent",
+			emailHeader:  "X-Auth-Request-Email",
+			groupsHeader: "X-Auth-Request-Groups",
+			headers:      map[string][]string{"X-Auth-Request-Email": {"amelie@example.com"}},
+			want:         user{login: "amelie@example.com"},
+		},
+		{
+			name:        "groups header sent but not configured",
+			emailHeader: "X-Auth-Request-Email",
+			headers:     map[string][]string{"X-Auth-Request-Email": {"amelie@example.com"}, "X-Auth-Request-Groups": {"eng@example.com"}},
+			want:        user{login: "amelie@example.com"},
+		},
+		{
+			name:         "groups header repeated instead of comma-separated",
+			emailHeader:  "X-Auth-Request-Email",
+			groupsHeader: "X-Auth-Request-Groups",
+			headers: map[string][]string{
+				"X-Auth-Request-Email":  {"amelie@example.com"},
+				"X-Auth-Request-Groups": {"eng@example.com", "admins@example.com"},
+			},
+			want: user{login: "amelie@example.com", groups: []string{"eng@example.com", "admins@example.com"}},
+		},
+		{
+			name:        "email header missing",
+			emailHeader: "X-Auth-Request-Email",
+			headers:     map[string][]string{"X-Auth-Request-Groups": {"eng@example.com"}},
+			wantErr:     true,
+		},
+		{
+			name:              "email header missing, unknown users allowed",
+			emailHeader:       "X-Auth-Request-Email",
+			headers:           map[string][]string{},
+			allowUnknownUsers: true,
+			want:              user{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			oldEmailHeader, oldGroupsHeader, oldAllowUnknownUsers := *authEmailHeader, *authGroupsHeader, *allowUnknownUsers
+			*authEmailHeader, *authGroupsHeader, *allowUnknownUsers = tt.emailHeader, tt.groupsHeader, tt.allowUnknownUsers
+			t.Cleanup(func() {
+				*authEmailHeader, *authGroupsHeader, *allowUnknownUsers = oldEmailHeader, oldGroupsHeader, oldAllowUnknownUsers
+			})
+
+			r := httptest.NewRequest("GET", "/", nil)
+			for k, values := range tt.headers {
+				for _, v := range values {
+					r.Header.Add(k, v)
+				}
+			}
+
+			got, err := proxyUser(r)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("proxyUser() error = %v; wantErr %v", err, tt.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if !cmp.Equal(got, tt.want, cmp.AllowUnexported(user{})) {
+				t.Errorf("proxyUser() = %+v; want %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestProxyUserAdmin tests the two halves of running behind an authenticating
+// proxy together: the groups the proxy reports make a user an admin when the
+// Admins table lists one of them.
+func TestProxyUserAdmin(t *testing.T) {
+	oldEmailHeader, oldGroupsHeader, oldOpenLinks := *authEmailHeader, *authGroupsHeader, *openLinks
+	*authEmailHeader, *authGroupsHeader, *openLinks = "X-Auth-Request-Email", "X-Auth-Request-Groups", true
+	t.Cleanup(func() {
+		*authEmailHeader, *authGroupsHeader, *openLinks = oldEmailHeader, oldGroupsHeader, oldOpenLinks
+	})
+
+	oldCurrentUser := currentUser
+	currentUser = proxyUser
+	t.Cleanup(func() { currentUser = oldCurrentUser })
+
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Save(&Link{Short: "lk", Long: "/before", Owner: "amelie@example.com", Locked: true})
+	if _, err := db.db.Exec(`INSERT INTO Admins (Name) VALUES ('group:admins@example.com')`); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name       string
+		groups     string
+		wantStatus int
+	}{
+		{name: "no groups", groups: "", wantStatus: http.StatusForbidden},
+		{name: "groups without the admin group", groups: "eng@example.com", wantStatus: http.StatusForbidden},
+		{name: "groups including the admin group", groups: "eng@example.com,admins@example.com", wantStatus: http.StatusOK},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			form := url.Values{
+				"short": {"lk"},
+				"long":  {"/after"},
+				"owner": {"amelie@example.com"},
+				"xsrf":  {xsrftoken.Generate(xsrfKey, "bob@example.com", "lk")},
+			}
+			r := httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			r.Header.Set("X-Auth-Request-Email", "bob@example.com")
+			r.Header.Set("X-Auth-Request-Groups", tt.groups)
+			w := httptest.NewRecorder()
+			serveSave(w, r)
+
+			if w.Code != tt.wantStatus {
+				t.Errorf("serveSave in groups %q = %d (%s); want %d", tt.groups, w.Code, w.Body.String(), tt.wantStatus)
+			}
+		})
+	}
+}
+
 func TestCanLockLink(t *testing.T) {
 	var (
 		link  = &Link{Short: "a", Owner: "foo@example.com"}

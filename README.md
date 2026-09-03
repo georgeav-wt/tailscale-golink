@@ -260,6 +260,35 @@ $ modal deploy golinks.py
 
 </details>
 
+## Running behind an authenticating proxy
+
+golink normally identifies users by their tailnet identity. If instead you run it
+behind a proxy that authenticates users itself, such as [oauth2-proxy], name the
+header that proxy sets and golink will take the user's identity from it:
+
+    golink -dev-listen :8080 -sqlitedb /home/nonroot/golink.db         -auth-email-header X-Auth-Request-Email         -auth-groups-header X-Auth-Request-Groups
+
+`-auth-groups-header` is optional, and names a header holding the user's groups
+as a comma-separated list. The groups are matched against the `Admins` table
+described below; they confer nothing on their own.
+
+> [!WARNING]
+> golink cannot tell a header set by your proxy from one set by whoever made the
+> request. Anything that can reach golink directly can therefore claim to be any
+> user, including an admin. Before using this, make sure that
+>
+>  - nothing but the proxy can open a connection to golink, enforced by the
+>    network rather than by convention -- a `NetworkPolicy`, a firewall, or by
+>    listening only on a loopback or unix socket the proxy shares; and
+>  - the proxy *sets* both headers on every request it forwards, rather than
+>    passing through headers it received.
+>
+> A request that arrives without the email header is refused, so a
+> misconfiguration fails closed rather than serving an anonymous user, unless
+> you have also passed `-allow-unknown-users`.
+
+[oauth2-proxy]: https://github.com/oauth2-proxy/oauth2-proxy
+
 ## Permissions
 
 By default, users own the links they create and only they can update or delete those links.
