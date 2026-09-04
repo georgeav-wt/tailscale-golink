@@ -1,0 +1,68 @@
+# The local development stack: nginx in front of golink, shaped like the
+# deployment but with no authentication at all. nginx hands golink a fixed
+# identity, so the whole flow is browsable without Google.
+#
+#   podman compose up -d --build
+#   podman compose restart nginx          # after a rebuild; see below
+#   open http://localhost:8080/fadsfads   # the create form, name filled in
+#
+# nginx resolves golink's address once, when it starts. Rebuilding golink gives
+# the container a new address, which nginx will not notice, so restart it. In
+# the cluster a Service keeps one address and this does not come up.
+#
+# golink's audit log is one JSON object per line on its stdout, so
+# "podman compose logs golink" shows what a log collector would ship.
+#
+# To serve it on http://localhost/ instead of :8080:
+#
+#   ./start-dev.sh 80
+#
+# The database is ./data/golink.db, on the host, so sqlite3 opens it directly:
+#
+#   sqlite3 data/golink.db "SELECT Short, Owner FROM Links;"
+#   sqlite3 data/golink.db "INSERT INTO Admins (Name) VALUES ('you@wetravel.com');"
+#
+# To import an export (JSON Lines, as /.export produces), with golink stopped so
+# that only one process is writing:
+#
+#   ./import.sh /private/tmp/links_export.json
+#
+# The restore adds links and skips names that already exist, so it cannot push
+# a changed destination over a link that is already there.
+#
+# golink's own port is deliberately not published. Production requires that
+# nothing but nginx can reach it, and testing through nginx is the point of
+# this stack; add a ports entry if you need to compare against it directly.
+
+services:
+  golink:
+    build: .
+    command:
+      - -dev-listen=:8080
+      - -sqlitedb=/home/nonroot/golink.db
+      - -open-links
+      - -auth-email-header=X-Auth-Request-Email
+      - -auth-groups-header=X-Auth-Request-Groups
+    volumes:
+      # A directory in the working tree, not a named volume: a named one was
+      # removed once by a compose invocation that was only meant to swap
+      # stacks, taking the links with it, and this way the database is a file
+      # on the host that sqlite3 can open directly.
+      - ./data:/home/nonroot
+
+  nginx:
+    image: docker.io/library/nginx:1.29-alpine
+    ports:
+      # The whole spec, because which addresses can be used depends on the
+      # port: podman will bind a privileged port only to every address, never
+      # to one. start-dev.sh works that out. Loopback by default, since this
+      # stack has no authentication of its own.
+      - "${GOLINK_PUBLISH:-127.0.0.1:8080:80}"
+    volumes:
+      # Sorts before the server block, so the map is in place first.
+      - ./deploy/nginx/patterns.conf:/etc/nginx/conf.d/00-patterns.conf:ro
+      # Replaces the image's own default server, which would otherwise be the
+      # one nginx picks for an unmatched Host.
+      - ./deploy/nginx/golink-dev.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - golink

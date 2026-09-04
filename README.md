@@ -131,6 +131,12 @@ To initialize the container with an auth key run:
 
     docker compose run --rm --env 'TS_AUTHKEY=tskey-auth-<key>' golink
 
+The `compose.yaml` in this repository is a different thing: it is the local
+development stack for running golink behind an authenticating proxy, where nginx
+stands in for one and authenticates nobody. Start it with `./start-dev.sh`, and
+see the comments in that file and in `deploy/nginx/`. `./start-prod.sh` runs the
+same arrangement with a real oauth2-proxy in front of it.
+
 ## MagicDNS
 
 When golink joins your tailnet, it will attempt to use "go" as its node name,

@@ -1,0 +1,62 @@
+# The production arrangement, on this machine: nginx authenticates every
+# request through oauth2-proxy against Google, exactly as deploy/nginx/golink.conf
+# describes. Run it with ./start-prod.sh, which checks the credentials it needs.
+#
+# The cluster runs these same three parts from its own manifests. What this file
+# is for is finding out that the nginx config and the flags are right before
+# they go there -- in particular which header oauth2-proxy actually sets, since
+# that is the one thing golink has to be told.
+
+services:
+  golink:
+    build: .
+    command:
+      - -dev-listen=:8080
+      - -sqlitedb=/home/nonroot/golink.db
+      - -open-links
+      - -auth-email-header=X-Auth-Request-Email
+      - -auth-groups-header=X-Auth-Request-Groups
+    volumes:
+      # A directory in the working tree, not a named volume: a named one was
+      # removed once by a compose invocation that was only meant to swap
+      # stacks, taking the links with it, and this way the database is a file
+      # on the host that sqlite3 can open directly.
+      - ./data:/home/nonroot
+
+  oauth2-proxy:
+    image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+    command:
+      - --provider=google
+      - --http-address=0.0.0.0:4180
+      # Behind nginx, so trust its X-Forwarded-* headers when building URLs.
+      - --reverse-proxy=true
+      # Puts the identity on the /oauth2/auth response, which is where nginx's
+      # auth_request_set picks it up. Without this nginx has nothing to copy.
+      - --set-xauthrequest=true
+      # nginx proxies the application itself; oauth2-proxy only answers about
+      # who somebody is.
+      - --upstream=static://202
+      - --email-domain=${GOLINK_EMAIL_DOMAIN:-wetravel.com}
+      - --client-id=${GOLINK_OAUTH_CLIENT_ID}
+      - --client-secret=${GOLINK_OAUTH_CLIENT_SECRET}
+      - --cookie-secret=${GOLINK_COOKIE_SECRET}
+      - --redirect-url=${GOLINK_REDIRECT_URL:-http://localhost:8080/oauth2/callback}
+      # Only because this runs over plain http locally. In the cluster, where
+      # TLS terminates in front, leave this out so the cookie is Secure.
+      - --cookie-secure=false
+
+  nginx:
+    image: docker.io/library/nginx:1.29-alpine
+    ports:
+      # The whole spec, because which addresses can be used depends on the
+      # port: podman will bind a privileged port only to every address, never
+      # to one. start-dev.sh works that out. Loopback by default, since this
+      # stack has no authentication of its own.
+      - "${GOLINK_PUBLISH:-127.0.0.1:8080:80}"
+    volumes:
+      - ./deploy/nginx/patterns.conf:/etc/nginx/conf.d/00-patterns.conf:ro
+      # The production server block, not the dev one.
+      - ./deploy/nginx/golink.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - golink
+      - oauth2-proxy

@@ -3,3 +3,6 @@ package-lock.json
 .direnv
 .envrc
 result
+golink
+golink.db
+/data/
