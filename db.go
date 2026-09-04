@@ -37,7 +37,11 @@ type Link struct {
 
 	Created  time.Time
 	LastEdit time.Time // when the link was last edited
-	Owner    string    // user@domain
+	// LastEditBy is who last saved the link. It is empty for a link last
+	// saved before golink recorded this, which cannot be worked out after
+	// the fact.
+	LastEditBy string `json:",omitempty"`
+	Owner      string // user@domain
 	// Locked reports whether only Owner and admins may edit the link.
 	// It is omitted when exporting unlocked links, so that snapshots of
 	// databases without any locked links are unchanged.
@@ -134,13 +138,13 @@ func (s *SQLiteDB) Now() time.Time {
 
 // linkColumns are the columns of the Links table that make up a Link, in the
 // order scanLink reads them.
-const linkColumns = "Short, Long, Pattern, Created, LastEdit, Owner, Locked"
+const linkColumns = "Short, Long, Pattern, Created, LastEdit, LastEditBy, Owner, Locked"
 
 // scanLink reads a single Link from a query result.
 func scanLink(row interface{ Scan(...any) error }) (*Link, error) {
 	link := new(Link)
 	var created, lastEdit int64
-	if err := row.Scan(&link.Short, &link.Long, &link.Pattern, &created, &lastEdit, &link.Owner, &link.Locked); err != nil {
+	if err := row.Scan(&link.Short, &link.Long, &link.Pattern, &created, &lastEdit, &link.LastEditBy, &link.Owner, &link.Locked); err != nil {
 		return nil, err
 	}
 	link.Created = time.Unix(created, 0).UTC()
@@ -202,7 +206,7 @@ func (s *SQLiteDB) Save(link *Link) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Pattern, Created, LastEdit, Owner, Locked) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", linkID(link.Short), link.Short, link.Long, link.Pattern, link.Created.Unix(), link.LastEdit.Unix(), link.Owner, boolToInt(link.Locked))
+	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Pattern, Created, LastEdit, LastEditBy, Owner, Locked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", linkID(link.Short), link.Short, link.Long, link.Pattern, link.Created.Unix(), link.LastEdit.Unix(), link.LastEditBy, link.Owner, boolToInt(link.Locked))
 	if err != nil {
 		return err
 	}

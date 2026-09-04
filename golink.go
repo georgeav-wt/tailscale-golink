@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"html/template"
+	"io"
 	"io/fs"
 	"log"
 	"net"
@@ -1202,6 +1203,7 @@ func serveDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deleteLinkStats(link)
+	logAudit("delete", cu, link, nil)
 
 	deleteTmpl.Execute(w, deleteData{
 		Short:   link.Short,
@@ -1320,8 +1322,8 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UTC()
 	newLink := false
-	// The link is edited in place below, so keep a copy of what it looked
-	// like before: the owner it has now is whose permission a lock needs.
+	// The link is edited in place below, so the audit log needs its own copy
+	// of what it looked like before.
 	var previous *Link
 	if link == nil {
 		link = &Link{
@@ -1337,6 +1339,7 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 	link.Long = long
 	link.Pattern = pattern
 	link.LastEdit = now
+	link.LastEditBy = cu.login
 	link.Owner = owner
 	if setLocked && locked != link.Locked {
 		// Whose permission this needs is the owner the link has now, not the
@@ -1356,6 +1359,12 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 	if err := db.Save(link); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+
+	if newLink {
+		logAudit("create", cu, link, nil)
+	} else {
+		logAudit("update", cu, link, previous)
 	}
 
 	if acceptHTML(r) {
@@ -1433,6 +1442,75 @@ func lockRefusal(link *Link) string {
 		return fmt.Sprintf("only %q or an admin can lock this link", link.Owner)
 	}
 	return "only an admin can lock a link"
+}
+
+// auditWriter is where the audit log goes. Stdout, so that whatever collects
+// container output ships it, leaving golink with no idea where the lines end
+// up and nothing to retry. golink's operational logging stays on stderr, so
+// the two do not have to be told apart.
+//
+// It is a variable so tests can read what was written.
+var auditWriter io.Writer = os.Stdout
+
+// auditMu serialises audit lines, so that two requests cannot interleave
+// halves of a JSON object.
+var auditMu sync.Mutex
+
+// auditEntry is one line of the audit log. The first few fields are named the
+// way log collectors expect to find them, so that a line arrives as a parsed
+// event rather than a wall of text.
+type auditEntry struct {
+	Timestamp time.Time  `json:"timestamp"`
+	Status    string     `json:"status"`
+	Service   string     `json:"service"`
+	Message   string     `json:"message"`
+	Action    string     `json:"action"`
+	Short     string     `json:"short"`
+	User      string     `json:"user"`
+	Link      *auditLink `json:"link,omitempty"`
+	Previous  *auditLink `json:"previous,omitempty"`
+}
+
+// auditLink is the part of a Link worth recording a change to.
+type auditLink struct {
+	Long    string `json:"long,omitempty"`
+	Pattern string `json:"pattern,omitempty"`
+	Owner   string `json:"owner,omitempty"`
+	Locked  bool   `json:"locked,omitempty"`
+}
+
+func newAuditLink(link *Link) *auditLink {
+	if link == nil {
+		return nil
+	}
+	return &auditLink{Long: link.Long, Pattern: link.Pattern, Owner: link.Owner, Locked: link.Locked}
+}
+
+// logAudit records a change to a link. Changes made any other way -- restoring
+// a snapshot, or editing the database by hand -- are not recorded, since they
+// do not pass through here.
+func logAudit(action string, u user, link, previous *Link) {
+	who := u.login
+	if who == "" {
+		who = "unknown"
+	}
+	entry := auditEntry{
+		Timestamp: time.Now().UTC(),
+		Status:    "info",
+		Service:   "golink",
+		Message:   fmt.Sprintf("%s %s/%s by %s", action, defaultHostname, link.Short, who),
+		Action:    action,
+		Short:     link.Short,
+		User:      who,
+		Link:      newAuditLink(link),
+		Previous:  newAuditLink(previous),
+	}
+
+	auditMu.Lock()
+	defer auditMu.Unlock()
+	if err := json.NewEncoder(auditWriter).Encode(entry); err != nil {
+		log.Printf("writing audit log: %v", err)
+	}
 }
 
 // serveExport prints a snapshot of the link database. Links are JSON encoded

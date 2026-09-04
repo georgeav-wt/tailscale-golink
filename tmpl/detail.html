@@ -52,7 +52,7 @@
         <dd>{{.Link.Created.Format "Jan _2, 2006 3:04pm MST"}}</dd>
 
         <dt class="text-sm font-bold mt-6">Date Last Edited</dt>
-        <dd>{{.Link.LastEdit.Format "Jan _2, 2006 3:04pm MST"}}</dd>
+        <dd>{{.Link.LastEdit.Format "Jan _2, 2006 3:04pm MST"}}{{ with .Link.LastEditBy }} by {{.}}{{ end }}</dd>
       </dl>
 
       <button type=submit class="py-2 px-4 my-4 rounded-md bg-blue-500 border-blue-500 text-white hover:bg-blue-600 hover:border-blue-600">Update</button>
@@ -87,7 +87,7 @@
       <dd>{{.Link.Created.Format "Jan _2, 2006 3:04pm MST"}}</dd>
 
       <dt class="text-sm font-bold mt-6">Date Last Edited</dt>
-      <dd>{{.Link.LastEdit.Format "Jan _2, 2006 3:04pm MST"}}</dd>
+      <dd>{{.Link.LastEdit.Format "Jan _2, 2006 3:04pm MST"}}{{ with .Link.LastEditBy }} by {{.}}{{ end }}</dd>
     </dl>
     {{ end }}
 {{ end }}

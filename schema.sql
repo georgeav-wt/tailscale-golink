@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS Links (
 	Created  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), -- unix seconds
 	LastEdit INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), -- unix seconds
 	Owner	 TEXT    NOT NULL DEFAULT "",
+	LastEditBy TEXT  NOT NULL DEFAULT "", -- who saved it last, if known
 	Locked   INTEGER NOT NULL DEFAULT 0,   -- if 1, only Owner or an admin may edit
 	-- the template expanded for a path below the link's name. A link with no
 	-- pattern answers to its own name only.

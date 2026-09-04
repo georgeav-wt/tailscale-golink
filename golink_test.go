@@ -4,9 +4,11 @@
 package golink
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -27,6 +29,8 @@ import (
 func init() {
 	// tests always need golink to be run in dev mode
 	*dev = ":8080"
+	// and they should not print an audit log; TestAuditLog reads its own.
+	auditWriter = io.Discard
 }
 
 func TestServeGo(t *testing.T) {
@@ -975,6 +979,119 @@ func TestRestoreSnapshot(t *testing.T) {
 		if link.Long != tt.wantLong || link.Pattern != tt.wantPattern {
 			t.Errorf("restored %q = (Long %q, Pattern %q); want (%q, %q)", tt.short, link.Long, link.Pattern, tt.wantLong, tt.wantPattern)
 		}
+	}
+}
+
+// TestAuditLog tests that every change to a link is recorded, with who made
+// it and what the link looked like before, and that the link itself remembers
+// who saved it last.
+func TestAuditLog(t *testing.T) {
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	oldWriter := auditWriter
+	auditWriter = &buf
+	t.Cleanup(func() { auditWriter = oldWriter })
+
+	// So that one user can edit another's link, as they can in the deployment.
+	oldOpenLinks := *openLinks
+	*openLinks = true
+	t.Cleanup(func() { *openLinks = oldOpenLinks })
+
+	as := func(login string) func(*http.Request) (user, error) {
+		return func(*http.Request) (user, error) { return user{login: login}, nil }
+	}
+	post := func(t *testing.T, path string, form url.Values, login string) {
+		t.Helper()
+		oldCurrentUser := currentUser
+		currentUser = as(login)
+		defer func() { currentUser = oldCurrentUser }()
+
+		r := httptest.NewRequest("POST", path, strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		serveHandler().ServeHTTP(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("POST %s as %s = %d (%s); want 200", path, login, w.Code, w.Body.String())
+		}
+	}
+	nextEntry := func(t *testing.T) auditEntry {
+		t.Helper()
+		var entry auditEntry
+		if err := json.NewDecoder(&buf).Decode(&entry); err != nil {
+			t.Fatalf("decoding audit line: %v", err)
+		}
+		if entry.Service != "golink" || entry.Status != "info" || entry.Timestamp.IsZero() {
+			t.Errorf("audit entry missing collector fields: %+v", entry)
+		}
+		return entry
+	}
+
+	// Create.
+	post(t, "/", url.Values{
+		"short": {"lk"}, "long": {"http://before/"},
+		"xsrf": {xsrftoken.Generate(xsrfKey, "amelie@example.com", newShortName)},
+	}, "amelie@example.com")
+
+	entry := nextEntry(t)
+	if entry.Action != "create" || entry.Short != "lk" || entry.User != "amelie@example.com" {
+		t.Errorf("create entry = %+v", entry)
+	}
+	if entry.Link == nil || entry.Link.Long != "http://before/" {
+		t.Errorf("create entry link = %+v", entry.Link)
+	}
+	if entry.Previous != nil {
+		t.Errorf("create entry has a previous state: %+v", entry.Previous)
+	}
+	if link, err := db.Load("lk"); err != nil {
+		t.Fatal(err)
+	} else if link.LastEditBy != "amelie@example.com" {
+		t.Errorf("LastEditBy after create = %q; want amelie@example.com", link.LastEditBy)
+	}
+
+	// Update, by somebody else, which the open-links model allows.
+	post(t, "/", url.Values{
+		"short": {"lk"}, "long": {"http://after/"}, "owner": {"amelie@example.com"},
+		"xsrf": {xsrftoken.Generate(xsrfKey, "bob@example.com", "lk")},
+	}, "bob@example.com")
+
+	entry = nextEntry(t)
+	if entry.Action != "update" || entry.User != "bob@example.com" {
+		t.Errorf("update entry = %+v", entry)
+	}
+	if entry.Link == nil || entry.Link.Long != "http://after/" {
+		t.Errorf("update entry link = %+v", entry.Link)
+	}
+	if entry.Previous == nil || entry.Previous.Long != "http://before/" {
+		t.Errorf("update entry previous = %+v", entry.Previous)
+	}
+	if link, err := db.Load("lk"); err != nil {
+		t.Fatal(err)
+	} else if link.LastEditBy != "bob@example.com" {
+		t.Errorf("LastEditBy after update = %q; want bob@example.com", link.LastEditBy)
+	} else if link.Owner != "amelie@example.com" {
+		t.Errorf("owner after another user's edit = %q; want amelie@example.com", link.Owner)
+	}
+
+	// Delete.
+	post(t, "/.delete/lk", url.Values{
+		"xsrf": {xsrftoken.Generate(xsrfKey, "bob@example.com", "lk")},
+	}, "bob@example.com")
+
+	entry = nextEntry(t)
+	if entry.Action != "delete" || entry.Short != "lk" || entry.User != "bob@example.com" {
+		t.Errorf("delete entry = %+v", entry)
+	}
+	if entry.Link == nil || entry.Link.Long != "http://after/" {
+		t.Errorf("delete entry link = %+v", entry.Link)
+	}
+
+	if buf.Len() != 0 {
+		t.Errorf("audit log has %d unread bytes: %s", buf.Len(), buf.String())
 	}
 }
 
