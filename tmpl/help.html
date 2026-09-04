@@ -10,8 +10,9 @@ All {{go}} links have a <strong>short name</strong> and a <strong>destination li
 Some notes on short names:
 
 <ul>
-  <li>names must start with a letter or number
   <li>names may contain letters, numbers, hyphens, and periods
+  <li>names may contain slashes, and every segment must start with a letter or number
+    ({{go}}/team/jira is a name in its own right)
   <li>names are <strong>not</strong> case-sensitive ({{go}}/foo is the same as {{go}}/FOO)
   <li>hyphens are ignored when resolving links ({{go}}/meetingnotes is the same as {{go}}/meeting-notes)
 </ul>
@@ -37,18 +38,31 @@ When logged in to your Tailscale network, {{go}} links can be entered directly i
 You do not need any additional browser extensions.
 
 <p>
-Any additional path provided after the short name will be added to the end of the destination link.
-For example, if <strong>{{go}}/who</strong> goes to your company directory at <strong>http://directory/</strong>,
-then <strong>{{go}}/who/amelie</strong> will go to <strong>http://directory/amelie</strong>.
+A link answers to its own name. Give it a <strong>pattern</strong> as well, and it
+answers to every path below its name too, with that path available to the pattern as
+<code>.Path</code>. For example, a link named <strong>{{go}}/who</strong> whose
+destination is your company directory at <strong>http://directory/</strong> and whose
+pattern is <strong>http://directory/{{ printf "{{.Path}}" }}</strong> sends
+<strong>{{go}}/who</strong> to the directory and <strong>{{go}}/who/amelie</strong> to
+that person's page.
 
 <p>
-<a href="#advanced">Advanced destination links</a> allow you to further customize this behavior.
-
-<h2 id="advanced">Advanced destination links</h2>
+A link with no pattern answers to nothing but its own name, which leaves every path
+below it free: with no pattern on <strong>{{go}}/who</strong>,
+<strong>{{go}}/who/amelie</strong> would offer to create a link by that name instead.
+A link named for a path always wins over a pattern above it, and the longest such name
+wins.
 
 <p>
-To have more control over how {{go}} links are resolved, destination links can use <a href="https://pkg.go.dev/text/template">Go template syntax</a>.
-Templates are provided a data structure with the following fields:
+<a href="#advanced">Advanced patterns</a> allow you to further customize this behavior.
+
+<h2 id="advanced">Advanced patterns</h2>
+
+<p>
+A pattern is written in <a href="https://pkg.go.dev/text/template">Go template syntax</a>.
+Destinations are not: a destination is the URL to go to, used exactly as written, and
+everything below is about the pattern beside it.
+Patterns are provided a data structure with the following fields:
 
 <ul>
   <li><code>.Path</code> is the remaining path value after the short name (without a leading slash).
@@ -71,37 +85,64 @@ Templates also have access to the following template functions:
 </ul>
 
 <p>
-The most common use of advanced destination links is to put the additional path in a custom location in the destination link.
-For example, you might set the destination for <strong>{{go}}/search</strong> to:
+The most common use of a pattern is to put the additional path in a custom location in
+the URL. For example, you might give <strong>{{go}}/search</strong> the destination:
 
-<pre>{{`https://www.google.com/{{if .Path}}search?q={{QueryEscape .Path}}{{end}}`}}</pre>
+<pre>https://www.google.com/</pre>
 
-When a user visits <strong>{{go}}/search</strong> with no additional path, they will be directed to <a href="https://www.google.com/">https://www.google.com/</a>.
-If they include an additional path like <strong>{{go}}/search/pangolins</strong>, they will be directed to <a href="https://www.google.com/search?q=pangolins">https://www.google.com/search?q=pangolins</a>.
+and the pattern:
+
+<pre>{{`https://www.google.com/search?q={{QueryEscape .Path}}`}}</pre>
+
+When a user visits <strong>{{go}}/search</strong> with no additional path, they will be
+directed to <a href="https://www.google.com/">https://www.google.com/</a>, the
+destination. If they include an additional path like
+<strong>{{go}}/search/pangolins</strong>, the pattern sends them to
+<a href="https://www.google.com/search?q=pangolins">https://www.google.com/search?q=pangolins</a>.
+The destination is what spares the pattern from having to test whether
+<code>.Path</code> is empty.
 
 <h3>Examples</h3>
 
 <div class="overflow-auto">
   <table>
+    <thead class="text-left">
+      <tr>
+        <th></th>
+        <th>Name</th>
+        <th>Destination</th>
+        <th>Pattern</th>
+      </tr>
+    </thead>
     <tr>
       <td>Include path in query</td>
       <td>{{go}}/search</td>
-      <td>{{`https://cloudsearch.google.com/{{if .Path}}cloudsearch/search?q={{QueryEscape .Path}}{{end}}`}}</td>
+      <td>https://cloudsearch.google.com/</td>
+      <td>{{`https://cloudsearch.google.com/cloudsearch/search?q={{QueryEscape .Path}}`}}</td>
     </tr>
     <tr>
       <td>Include path in destination path</td>
       <td>{{go}}/slack</td>
-      <td>{{`https://company.slack.com/{{if .Path}}channels/{{PathEscape .Path}}{{end}}`}}</td>
+      <td>https://company.slack.com/</td>
+      <td>{{`https://company.slack.com/channels/{{PathEscape .Path}}`}}</td>
     </tr>
     <tr>
       <td>Include path in hostname</td>
       <td>{{go}}/varz</td>
-      <td>{{`http://{{if .Path}}{{.Path}}{{else}}host{{end}}.example/debug/varz`}}</td>
+      <td>http://host.example/debug/varz</td>
+      <td>{{`http://{{.Path}}.example/debug/varz`}}</td>
     </tr>
     <tr>
       <td>Include today's date in wiki page</td>
       <td>{{go}}/today</td>
+      <td></td>
       <td>{{`http://wiki/{{.Now.Format "01-02-2006"}}`}}</td>
+    </tr>
+    <tr>
+      <td>Answer to one name only</td>
+      <td>{{go}}/team</td>
+      <td>https://wiki/team</td>
+      <td></td>
     </tr>
   </table>
 </div>
@@ -135,10 +176,11 @@ This is useful to create data snapshots that can be restored later.
 </pre>
 
 <p>
-Create a new link by sending a POST request with a <code>short</code> and <code>long</code> value:
+Create a new link by sending a POST request with a <code>short</code> value and a
+<code>long</code> value, a <code>pattern</code> value, or both:
 
 <pre>$ curl -L --post302 -H Sec-Golink:1 -d short=cs -d long=https://cs.github.com/ {{go}}
-{{`{"Short":"cs","Long":"https://cs.github.com/","Created":"2022-06-03T22:15:29.993978392Z","LastEdit":"2022-06-03T22:15:29.993978392Z","Owner":"amelie@example.com"}`}}
+{{`{"Short":"cs","Long":"https://cs.github.com/","Pattern":"","Created":"2022-06-03T22:15:29.993978392Z","LastEdit":"2022-06-03T22:15:29.993978392Z","Owner":"amelie@example.com"}`}}
 </pre>
 
 </article>

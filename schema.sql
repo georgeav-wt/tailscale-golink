@@ -5,7 +5,10 @@ CREATE TABLE IF NOT EXISTS Links (
 	Created  INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), -- unix seconds
 	LastEdit INTEGER NOT NULL DEFAULT (strftime('%s', 'now')), -- unix seconds
 	Owner	 TEXT    NOT NULL DEFAULT "",
-	Locked   INTEGER NOT NULL DEFAULT 0    -- if 1, only Owner or an admin may edit
+	Locked   INTEGER NOT NULL DEFAULT 0,   -- if 1, only Owner or an admin may edit
+	-- the template expanded for a path below the link's name. A link with no
+	-- pattern answers to its own name only.
+	Pattern  TEXT    NOT NULL DEFAULT ""
 );
 
 -- Admins is managed by the operator, directly in the database. golink only ever

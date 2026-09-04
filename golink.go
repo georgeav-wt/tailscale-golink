@@ -381,9 +381,10 @@ type homeData struct {
 
 // deleteData is the data used by deleteTmpl.
 type deleteData struct {
-	Short string
-	Long  string
-	XSRF  string
+	Short   string
+	Long    string
+	Pattern string
+	XSRF    string
 }
 
 var xsrfKey string
@@ -647,6 +648,39 @@ func serveOpenSearch(w http.ResponseWriter, _ *http.Request) {
 	opensearchTmpl.Execute(w, nil)
 }
 
+// loadLink loads the link with the specified short name, retrying without any
+// trailing punctuation. That catches auto-linking and copy/paste issues that
+// include punctuation.
+func loadLink(short string) (*Link, error) {
+	link, err := db.Load(short)
+	if errors.Is(err, fs.ErrNotExist) {
+		if s := strings.TrimRight(short, ".,()[]{}"); s != short {
+			link, err = db.Load(s)
+		}
+	}
+	return link, err
+}
+
+// lookupLink returns the link that answers to the specified path, along with
+// the rest of the path to pass to the link's destination.
+//
+// Every link answers to its own name, which may itself contain slashes. A link
+// with a pattern answers to the paths below its name as well, the longest such
+// name winning; a link without one answers to nothing but its own name, so
+// that a path below it is free to become a link of its own.
+func lookupLink(path string) (*Link, string, error) {
+	link, err := loadLink(path)
+	if !errors.Is(err, fs.ErrNotExist) {
+		return link, "", err
+	}
+	for i := strings.LastIndex(path, "/"); i > 0; i = strings.LastIndex(path[:i], "/") {
+		if l, lerr := loadLink(path[:i]); lerr == nil && l.Pattern != "" {
+			return l, path[i+1:], nil
+		}
+	}
+	return nil, "", fs.ErrNotExist
+}
+
 func serveGo(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/" {
 		switch r.Method {
@@ -658,33 +692,24 @@ func serveGo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	short, remainder, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
+	path := strings.TrimPrefix(r.URL.Path, "/")
 
 	// redirect {name}+ links to /.detail/{name}
-	if strings.HasSuffix(short, "+") {
-		http.Redirect(w, r, "/.detail/"+strings.TrimSuffix(short, "+"), http.StatusFound)
+	if strings.HasSuffix(path, "+") {
+		http.Redirect(w, r, "/.detail/"+strings.TrimSuffix(path, "+"), http.StatusFound)
 		return
 	}
 
-	link, err := db.Load(short)
+	link, remainder, err := lookupLink(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		// Trim common punctuation from the end and try again.
-		// This catches auto-linking and copy/paste issues that include punctuation.
-		if s := strings.TrimRight(short, ".,()[]{}"); short != s {
-			short = s
-			link, err = db.Load(short)
-		}
-	}
-
-	if errors.Is(err, fs.ErrNotExist) {
-		clickNotFound.WithLabelValues(short).Inc()
+		clickNotFound.WithLabelValues(path).Inc()
 		w.WriteHeader(http.StatusNotFound)
-		serveHome(w, r, short)
+		serveHome(w, r, path)
 		return
 	}
 	if err != nil {
-		clickNotFound.WithLabelValues(short).Inc()
-		log.Printf("serving %q: %v", short, err)
+		clickNotFound.WithLabelValues(path).Inc()
+		log.Printf("serving %q: %v", path, err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -704,7 +729,7 @@ func serveGo(w http.ResponseWriter, r *http.Request) {
 
 	cu, _ := requestUser(r)
 	env := expandEnv{Now: time.Now().UTC(), Path: remainder, user: cu.login, query: r.URL.Query()}
-	target, err := expandLink(link.Long, env)
+	target, err := resolveTarget(link, env)
 	if err != nil {
 		log.Printf("expanding %q: %v", link.Long, err)
 		if errors.Is(err, errNoUser) {
@@ -877,19 +902,44 @@ func expandLink(long string, env expandEnv) (*url.URL, error) {
 	if err != nil {
 		return nil, err
 	}
-
-	// add query parameters from original request
-	if len(env.query) > 0 {
-		query := u.Query()
-		for key, values := range env.query {
-			for _, v := range values {
-				query.Add(key, v)
-			}
-		}
-		u.RawQuery = query.Encode()
-	}
-
+	mergeQuery(u, env.query)
 	return u, nil
+}
+
+// resolveTarget returns the URL a link points to for a particular request.
+//
+// A link's destination is used exactly as written: nothing is appended to it
+// and it never reaches the template engine. A path below the link's name goes
+// through its pattern instead, which receives that path as .Path. A link with
+// a pattern and no destination expands the pattern for its bare name too,
+// with an empty .Path.
+func resolveTarget(link *Link, env expandEnv) (*url.URL, error) {
+	if env.Path == "" && link.Long != "" {
+		u, err := url.Parse(link.Long)
+		if err != nil {
+			return nil, err
+		}
+		mergeQuery(u, env.query)
+		return u, nil
+	}
+	if link.Pattern == "" {
+		return nil, fmt.Errorf("link %q has no destination", link.Short)
+	}
+	return expandLink(link.Pattern, env)
+}
+
+// mergeQuery adds the query parameters of the original request to u.
+func mergeQuery(u *url.URL, requestQuery url.Values) {
+	if len(requestQuery) == 0 {
+		return
+	}
+	query := u.Query()
+	for key, values := range requestQuery {
+		for _, v := range values {
+			query.Add(key, v)
+		}
+	}
+	u.RawQuery = query.Encode()
 }
 
 func devMode() bool { return *dev != "" }
@@ -1088,7 +1138,11 @@ func userExists(ctx context.Context, login string) (bool, error) {
 	return false, nil
 }
 
-var reShortName = regexp.MustCompile(`^\w[\w\-\.]*$`)
+// reShortName matches a valid short name: one or more slash-separated
+// segments, each starting with a letter or number. Requiring that first
+// character of every segment keeps a name from colliding with the internal
+// URLs, which all begin with a dot.
+var reShortName = regexp.MustCompile(`^\w[\w\-\.]*(/\w[\w\-\.]*)*$`)
 
 func serveDelete(w http.ResponseWriter, r *http.Request) {
 	if *readonly {
@@ -1135,9 +1189,10 @@ func serveDelete(w http.ResponseWriter, r *http.Request) {
 	deleteLinkStats(link)
 
 	deleteTmpl.Execute(w, deleteData{
-		Short: link.Short,
-		Long:  link.Long,
-		XSRF:  xsrftoken.Generate(xsrfKey, cu.login, newShortName),
+		Short:   link.Short,
+		Long:    link.Long,
+		Pattern: link.Pattern,
+		XSRF:    xsrftoken.Generate(xsrfKey, cu.login, newShortName),
 	})
 }
 
@@ -1149,17 +1204,27 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "golink is in read-only mode", http.StatusMethodNotAllowed)
 		return
 	}
-	short, long := r.FormValue("short"), r.FormValue("long")
-	if short == "" || long == "" {
-		http.Error(w, "short and long required", http.StatusBadRequest)
+	short, long, pattern := r.FormValue("short"), r.FormValue("long"), r.FormValue("pattern")
+	if pattern == "" && strings.Contains(long, "{{") {
+		// A template in the destination is how a link used to say that it
+		// answered for the paths below its name. Keep understanding clients
+		// that predate the pattern field.
+		long, pattern = legacyPattern(long, true)
+	}
+	if short == "" || (long == "" && pattern == "") {
+		http.Error(w, "short and either long or pattern required", http.StatusBadRequest)
 		return
 	}
 	if !reShortName.MatchString(short) {
-		http.Error(w, "short may only contain letters, numbers, dash, and period", http.StatusBadRequest)
+		http.Error(w, "short may only contain letters, numbers, dash, and period, in slash-separated segments", http.StatusBadRequest)
 		return
 	}
-	if _, err := texttemplate.New("").Funcs(expandFuncMap).Parse(long); err != nil {
-		http.Error(w, fmt.Sprintf("long contains an invalid template: %v", err), http.StatusBadRequest)
+	if strings.Contains(long, "{{") {
+		http.Error(w, "long is used as written; a template belongs in pattern", http.StatusBadRequest)
+		return
+	}
+	if _, err := texttemplate.New("").Funcs(expandFuncMap).Parse(pattern); err != nil {
+		http.Error(w, fmt.Sprintf("pattern contains an invalid template: %v", err), http.StatusBadRequest)
 		return
 	}
 
@@ -1202,7 +1267,9 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 			// The user submitted from the home page create form but the link
 			// already exists. Redirect to the detail page so they can edit it
 			// intentionally rather than accidentally overwriting it.
-			http.Redirect(w, r, "/.detail/"+url.PathEscape(short)+"?exists=1", http.StatusSeeOther)
+			// reShortName has already limited short to characters that need no
+			// escaping, and escaping would only turn its slashes into %2F.
+			http.Redirect(w, r, "/.detail/"+short+"?exists=1", http.StatusSeeOther)
 		} else {
 			http.Error(w, "invalid XSRF token", http.StatusBadRequest)
 		}
@@ -1245,6 +1312,7 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 	}
 	link.Short = short
 	link.Long = long
+	link.Pattern = pattern
 	link.LastEdit = now
 	link.Owner = owner
 	if setLocked && locked != link.Locked {
@@ -1442,12 +1510,11 @@ func resolveLink(link *url.URL) (*url.URL, error) {
 		path = strings.TrimPrefix(path, *hostname)
 	}
 
-	short, remainder, _ := strings.Cut(strings.TrimPrefix(path, "/"), "/")
-	l, err := db.Load(short)
+	l, remainder, err := lookupLink(strings.TrimPrefix(path, "/"))
 	if err != nil {
 		return nil, err
 	}
-	dst, err := expandLink(l.Long, expandEnv{Now: time.Now().UTC(), Path: remainder})
+	dst, err := resolveTarget(l, expandEnv{Now: time.Now().UTC(), Path: remainder})
 	if err == nil {
 		if dst.Host == "" || dst.Host == *hostname {
 			dst, err = resolveLink(dst)

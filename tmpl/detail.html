@@ -12,14 +12,21 @@
       <div class="flex flex-wrap">
         <div class="flex">
           <label for=short class="flex my-2 px-2 items-center bg-gray-100 border border-r-0 border-gray-300 rounded-l-md text-gray-700">http://{{go}}/</label>
-          <input id=short name=short required type=text size=15 placeholder="shortname" value="{{.Link.Short}}" pattern="\w[\w\-\.]*" title="Must start with letter or number; may contain letters, numbers, dashes, and periods."
+          <input id=short name=short required type=text size=15 placeholder="shortname" value="{{.Link.Short}}" pattern="\w[\w\-\.]*(/\w[\w\-\.]*)*" title="Must start with letter or number; may contain letters, numbers, dashes, and periods, and slashes between segments."
             class="p-2 my-2 rounded-r-md border-gray-300 placeholder:text-gray-400 disabled:bg-gray-100">
           <span class="flex m-2 items-center">&rarr;</span>
         </div>
-        <input name=long required type=text size=40 placeholder="https://destination-url" value="{{.Link.Long}}" class="p-2 my-2 mr-2 max-w-full rounded-md border-gray-300 placeholder:text-gray-400 disabled:bg-gray-100">
+        <input name=long type=text size=40 placeholder="https://destination-url" value="{{.Link.Long}}" class="p-2 my-2 mr-2 max-w-full rounded-md border-gray-300 placeholder:text-gray-400 disabled:bg-gray-100">
       </div>
 
-      <p class="text-sm text-gray-500"><a class="text-blue-600 hover:underline" href="/.help">Help and advanced options</a></p>
+      <label for=pattern class="text-sm font-bold block mt-2">Pattern for paths below this link <span class="font-normal text-gray-500">(optional)</span></label>
+      <div class="flex flex-wrap items-center">
+        <label for=pattern class="flex my-2 px-2 items-center bg-gray-100 border border-r-0 border-gray-300 rounded-l-md text-gray-700">{{go}}/{{.Link.Short}}/&hellip; &rarr;</label>
+        <input id=pattern name=pattern type=text size=40 placeholder="https://destination-url/{{ printf "{{.Path}}" }}" value="{{.Link.Pattern}}" class="p-2 my-2 rounded-r-md border-gray-300 placeholder:text-gray-400 disabled:bg-gray-100">
+      </div>
+      <p class="text-sm text-gray-500">With a pattern, this link also answers to every path below its name, and that path is available to the pattern as {{ printf "{{.Path}}" }}. Without one, it answers to its own name only.</p>
+
+      <p class="text-sm text-gray-500 mt-2"><a class="text-blue-600 hover:underline" href="/.help">Help and advanced options</a></p>
 
       <label for=owner class="text-sm font-bold block mt-4">Owner</label>
       <input id=owner name=owner required type=text size=25 placeholder="Owner" value="{{.Link.Owner}}" class="p-2 rounded-md border-gray-300 placeholder:text-gray-400 disabled:bg-gray-100">
@@ -57,8 +64,15 @@
       <dt class="text-sm font-bold mt-6">Name</dt>
       <dd><a class="text-blue-600 hover:underline" href="/{{.Link.Short}}">{{go}}/{{.Link.Short}}</a></dd>
 
+      {{ with .Link.Long }}
       <dt class="text-sm font-bold mt-6">Destination</dt>
-      <dd>{{.Link.Long}}</dd>
+      <dd>{{.}}</dd>
+      {{ end }}
+
+      {{ with .Link.Pattern }}
+      <dt class="text-sm font-bold mt-6">Pattern for paths below this link</dt>
+      <dd>{{.}}</dd>
+      {{ end }}
 
       <dt class="text-sm font-bold mt-6">Owner</dt>
       <dd>{{.Link.Owner}}{{ if .Link.Locked }} (locked; only the owner or an admin can change this link){{ end }}</dd>

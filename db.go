@@ -7,6 +7,7 @@ import (
 	"context"
 	"database/sql"
 	_ "embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -21,8 +22,19 @@ import (
 
 // Link is the structure stored for each go short link.
 type Link struct {
-	Short    string // the "foo" part of http://go/foo
-	Long     string // the target URL or text/template pattern to run
+	Short string // the "foo" part of http://go/foo
+	Long  string // where http://go/foo goes, used exactly as written
+
+	// Pattern is the text/template expanded for a path below the link's name,
+	// which is available to it as .Path. A link with no pattern answers to its
+	// own name and nothing else, leaving the paths below it free to become
+	// links of their own; a link with one answers to both.
+	//
+	// It is always exported, even when empty, so that a link written before
+	// patterns existed, which kept its template in Long, can be told apart
+	// from one that simply has no pattern. See UnmarshalJSON.
+	Pattern string
+
 	Created  time.Time
 	LastEdit time.Time // when the link was last edited
 	Owner    string    // user@domain
@@ -30,6 +42,50 @@ type Link struct {
 	// It is omitted when exporting unlocked links, so that snapshots of
 	// databases without any locked links are unchanged.
 	Locked bool `json:",omitempty"`
+}
+
+// UnmarshalJSON decodes a Link, converting one written before it could have a
+// pattern. Such a link kept its template in Long, and answered for the paths
+// below its name if it was dynamic; before there was a Dynamic field at all,
+// every link did.
+func (l *Link) UnmarshalJSON(b []byte) error {
+	type link Link // shed the methods of Link, so this does not recurse
+	aux := struct {
+		*link
+		Pattern *string
+		Dynamic *bool
+	}{link: (*link)(l)}
+	if err := json.Unmarshal(b, &aux); err != nil {
+		return err
+	}
+	if aux.Pattern != nil {
+		l.Pattern = *aux.Pattern
+		return nil
+	}
+	l.Long, l.Pattern = legacyPattern(l.Long, aux.Dynamic == nil || *aux.Dynamic)
+	return nil
+}
+
+// legacyPattern splits the destination of a link written before patterns
+// existed into a destination and a pattern.
+//
+// Such a link held either a plain URL or a template in Long, and if it was
+// dynamic it also answered for the paths below its name: a template was
+// expanded with the remaining path, and a plain URL had that path appended.
+func legacyPattern(long string, dynamic bool) (newLong, pattern string) {
+	if !dynamic {
+		return long, ""
+	}
+	if strings.Contains(long, "{{") {
+		// The template was the whole destination, and was expanded even for
+		// the bare name, with an empty path. A link with a pattern and no
+		// destination still does exactly that.
+		return "", long
+	}
+	if strings.HasSuffix(long, "/") {
+		return long, long + "{{.Path}}"
+	}
+	return long, long + "/{{.Path}}"
 }
 
 // ClickStats is the number of clicks a set of links have received in a given
@@ -84,14 +140,14 @@ func (s *SQLiteDB) LoadAll() ([]*Link, error) {
 	defer s.mu.RUnlock()
 
 	var links []*Link
-	rows, err := s.db.Query("SELECT Short, Long, Created, LastEdit, Owner, Locked FROM Links")
+	rows, err := s.db.Query("SELECT Short, Long, Pattern, Created, LastEdit, Owner, Locked FROM Links")
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		link := new(Link)
 		var created, lastEdit int64
-		err := rows.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner, &link.Locked)
+		err := rows.Scan(&link.Short, &link.Long, &link.Pattern, &created, &lastEdit, &link.Owner, &link.Locked)
 		if err != nil {
 			return nil, err
 		}
@@ -113,8 +169,8 @@ func (s *SQLiteDB) Load(short string) (*Link, error) {
 
 	link := new(Link)
 	var created, lastEdit int64
-	row := s.db.QueryRow("SELECT Short, Long, Created, LastEdit, Owner, Locked FROM Links WHERE ID = ?1 LIMIT 1", linkID(short))
-	err := row.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner, &link.Locked)
+	row := s.db.QueryRow("SELECT Short, Long, Pattern, Created, LastEdit, Owner, Locked FROM Links WHERE ID = ?1 LIMIT 1", linkID(short))
+	err := row.Scan(&link.Short, &link.Long, &link.Pattern, &created, &lastEdit, &link.Owner, &link.Locked)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = fs.ErrNotExist
@@ -131,11 +187,7 @@ func (s *SQLiteDB) Save(link *Link) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	locked := 0
-	if link.Locked {
-		locked = 1
-	}
-	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Created, LastEdit, Owner, Locked) VALUES (?, ?, ?, ?, ?, ?, ?)", linkID(link.Short), link.Short, link.Long, link.Created.Unix(), link.LastEdit.Unix(), link.Owner, locked)
+	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Pattern, Created, LastEdit, Owner, Locked) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", linkID(link.Short), link.Short, link.Long, link.Pattern, link.Created.Unix(), link.LastEdit.Unix(), link.Owner, boolToInt(link.Locked))
 	if err != nil {
 		return err
 	}
@@ -147,6 +199,14 @@ func (s *SQLiteDB) Save(link *Link) error {
 		return fmt.Errorf("expected to affect 1 row, affected %d", rows)
 	}
 	return nil
+}
+
+// boolToInt returns the integer SQLite stores for a boolean column.
+func boolToInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // Delete removes a Link using its short name.
@@ -276,14 +336,14 @@ func (s *SQLiteDB) GetLinksByOwner(owner string) ([]*Link, error) {
 	defer s.mu.RUnlock()
 
 	var links []*Link
-	rows, err := s.db.Query("SELECT Short, Long, Created, LastEdit, Owner, Locked FROM Links WHERE LOWER(Owner) = LOWER(?)", owner)
+	rows, err := s.db.Query("SELECT Short, Long, Pattern, Created, LastEdit, Owner, Locked FROM Links WHERE LOWER(Owner) = LOWER(?)", owner)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
 		link := new(Link)
 		var created, lastEdit int64
-		err := rows.Scan(&link.Short, &link.Long, &created, &lastEdit, &link.Owner, &link.Locked)
+		err := rows.Scan(&link.Short, &link.Long, &link.Pattern, &created, &lastEdit, &link.Owner, &link.Locked)
 		if err != nil {
 			return nil, err
 		}

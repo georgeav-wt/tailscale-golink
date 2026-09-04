@@ -35,9 +35,12 @@ func TestServeGo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Save(&Link{Short: "who", Long: "http://who/"})
-	db.Save(&Link{Short: "me", Long: "/who/{{.User}}"})
-	db.Save(&Link{Short: "invalid-var", Long: "/who/{{.Invalid}}"})
+	db.Save(&Link{Short: "who", Long: "http://who/", Pattern: "http://who/{{.Path}}"})
+	db.Save(&Link{Short: "me", Pattern: "/who/{{.User}}"})
+	db.Save(&Link{Short: "invalid-var", Pattern: "/who/{{.Invalid}}"})
+	db.Save(&Link{Short: "team", Long: "http://team/"})
+	db.Save(&Link{Short: "team/jira", Long: "http://jira/team"})
+	db.Save(&Link{Short: "team/board", Pattern: "http://board/{{.Path}}"})
 
 	tests := []struct {
 		name        string
@@ -115,8 +118,45 @@ func TestServeGo(t *testing.T) {
 			wantLink:   "/who/foo@example.com",
 		},
 		{
+			name:       "link with a slash in its name",
+			link:       "/team/jira",
+			wantStatus: http.StatusFound,
+			wantLink:   "http://jira/team",
+		},
+		{
+			name:       "link with a slash in its name, trailing period",
+			link:       "/team/jira.",
+			wantStatus: http.StatusFound,
+			wantLink:   "http://jira/team",
+		},
+		{
+			// "team" is not dynamic, so it answers to its own name only and a
+			// path below it is free to be a link of its own.
+			name:       "path below a link that is not dynamic",
+			link:       "/team/nothing-here",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "path below a link that is not dynamic, deeper",
+			link:       "/team/jira/sub",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			// The longest name that is dynamic wins, even with a shorter
+			// dynamic name above it.
+			name:       "path below a dynamic link with a slash in its name",
+			link:       "/team/board/42",
+			wantStatus: http.StatusFound,
+			wantLink:   "http://board/42",
+		},
+		{
 			name:       "unknown link",
 			link:       "/does-not-exist",
+			wantStatus: http.StatusNotFound,
+		},
+		{
+			name:       "unknown link with a slash",
+			link:       "/does-not/exist",
 			wantStatus: http.StatusNotFound,
 		},
 		{
@@ -365,6 +405,49 @@ func TestServeSave(t *testing.T) {
 			currentUser:  func(*http.Request) (user, error) { return user{login: "bar@example.com", isAdmin: true}, nil },
 			wantStatus:   http.StatusSeeOther,
 			wantLocation: "/.detail/who?exists=1",
+		},
+		{
+			name:       "save link with a slash in its name",
+			short:      "team/jira",
+			xsrf:       fooXSRF(newShortName),
+			long:       "http://jira/team",
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:         "redirect to detail page for a name with a slash",
+			short:        "team/jira",
+			xsrf:         fooXSRF(newShortName),
+			long:         "http://jira/team/updated",
+			wantStatus:   http.StatusSeeOther,
+			wantLocation: "/.detail/team/jira?exists=1",
+		},
+		{
+			name:       "leading slash",
+			short:      "/team",
+			xsrf:       fooXSRF(newShortName),
+			long:       "http://team/",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "trailing slash",
+			short:      "team/",
+			xsrf:       fooXSRF(newShortName),
+			long:       "http://team/",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "empty segment",
+			short:      "team//jira",
+			xsrf:       fooXSRF(newShortName),
+			long:       "http://team/",
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "segment starting with a dot",
+			short:      "team/.export",
+			xsrf:       fooXSRF(newShortName),
+			long:       "http://team/",
+			wantStatus: http.StatusBadRequest,
 		},
 		{
 			name:       "invalid xsrf",
@@ -705,6 +788,170 @@ func TestProxyUserAdmin(t *testing.T) {
 	}
 }
 
+// TestServeSavePattern tests that a save keeps a link's destination and its
+// pattern apart, and that a template arriving in the destination, which is how
+// a link used to say it answered for the paths below it, is understood.
+func TestServeSavePattern(t *testing.T) {
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name        string
+		short       string
+		form        url.Values
+		wantStatus  int
+		wantLong    string
+		wantPattern string
+	}{
+		{
+			name:       "destination only",
+			short:      "docs",
+			form:       url.Values{"long": {"https://wiki/docs"}},
+			wantStatus: http.StatusOK,
+			wantLong:   "https://wiki/docs",
+		},
+		{
+			name:        "destination and pattern",
+			short:       "code",
+			form:        url.Values{"long": {"https://github.com/org"}, "pattern": {"https://github.com/search?q={{QueryEscape .Path}}"}},
+			wantStatus:  http.StatusOK,
+			wantLong:    "https://github.com/org",
+			wantPattern: "https://github.com/search?q={{QueryEscape .Path}}",
+		},
+		{
+			name:        "pattern only",
+			short:       "jira",
+			form:        url.Values{"pattern": {"https://jira/browse/{{.Path}}"}},
+			wantStatus:  http.StatusOK,
+			wantPattern: "https://jira/browse/{{.Path}}",
+		},
+		{
+			// What a client that predates the pattern field sends.
+			name:        "template in the destination",
+			short:       "legacy",
+			form:        url.Values{"long": {"https://jira/browse/{{.Path}}"}},
+			wantStatus:  http.StatusOK,
+			wantPattern: "https://jira/browse/{{.Path}}",
+		},
+		{
+			name:       "template in the destination alongside a pattern",
+			short:      "both",
+			form:       url.Values{"long": {"https://a/{{.Path}}"}, "pattern": {"https://b/{{.Path}}"}},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "neither destination nor pattern",
+			short:      "empty",
+			form:       url.Values{},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "invalid template in pattern",
+			short:      "broken",
+			form:       url.Values{"pattern": {"https://a/{{.Path"}},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			// The pattern is dropped when the form says so, which is how a
+			// link stops answering for the paths below it.
+			name:       "pattern cleared",
+			short:      "code",
+			form:       url.Values{"long": {"https://github.com/org"}, "owner": {"foo@example.com"}},
+			wantStatus: http.StatusOK,
+			wantLong:   "https://github.com/org",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			form := url.Values{"short": {tt.short}}
+			for k, values := range tt.form {
+				form[k] = values
+			}
+			token := newShortName
+			if _, err := db.Load(tt.short); err == nil {
+				token = tt.short
+			}
+			form.Set("xsrf", xsrftoken.Generate(xsrfKey, "foo@example.com", token))
+
+			r := httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			w := httptest.NewRecorder()
+			serveSave(w, r)
+			if w.Code != tt.wantStatus {
+				t.Fatalf("serveSave(%v) = %d (%s); want %d", form, w.Code, w.Body.String(), tt.wantStatus)
+			}
+			if tt.wantStatus != http.StatusOK {
+				return
+			}
+
+			link, err := db.Load(tt.short)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if link.Long != tt.wantLong {
+				t.Errorf("link %q Long = %q; want %q", tt.short, link.Long, tt.wantLong)
+			}
+			if link.Pattern != tt.wantPattern {
+				t.Errorf("link %q Pattern = %q; want %q", tt.short, link.Pattern, tt.wantPattern)
+			}
+		})
+	}
+}
+
+// TestRestoreSnapshot tests that a snapshot written before links had patterns
+// restores to links that answer to the same URLs, and that one written since
+// is restored as it says.
+func TestRestoreSnapshot(t *testing.T) {
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oldSnapshot := LastSnapshot
+	LastSnapshot = []byte(`{"Short":"oldest","Long":"http://old/"}
+{"Short":"oldest-template","Long":"http://old/{{.Path}}"}
+{"Short":"was-static","Long":"http://static/","Dynamic":false}
+{"Short":"was-dynamic","Long":"http://dyn/","Dynamic":true}
+{"Short":"current","Long":"http://cur/","Pattern":"http://cur/{{.Path}}"}
+{"Short":"current-static","Long":"http://cur/","Pattern":""}
+`)
+	t.Cleanup(func() { LastSnapshot = oldSnapshot })
+
+	if err := restoreLastSnapshot(); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tt := range []struct {
+		short       string
+		wantLong    string
+		wantPattern string
+	}{
+		// Written when every link answered for the paths below it.
+		{short: "oldest", wantLong: "http://old/", wantPattern: "http://old/{{.Path}}"},
+		{short: "oldest-template", wantPattern: "http://old/{{.Path}}"},
+		// Written when a Dynamic flag said so.
+		{short: "was-static", wantLong: "http://static/"},
+		{short: "was-dynamic", wantLong: "http://dyn/", wantPattern: "http://dyn/{{.Path}}"},
+		// Written since patterns.
+		{short: "current", wantLong: "http://cur/", wantPattern: "http://cur/{{.Path}}"},
+		{short: "current-static", wantLong: "http://cur/"},
+	} {
+		link, err := db.Load(tt.short)
+		if err != nil {
+			t.Errorf("db.Load(%q): %v", tt.short, err)
+			continue
+		}
+		if link.Long != tt.wantLong || link.Pattern != tt.wantPattern {
+			t.Errorf("restored %q = (Long %q, Pattern %q); want (%q, %q)", tt.short, link.Long, link.Pattern, tt.wantLong, tt.wantPattern)
+		}
+	}
+}
+
 func TestCanLockLink(t *testing.T) {
 	var (
 		link  = &Link{Short: "a", Owner: "foo@example.com"}
@@ -965,9 +1212,9 @@ func TestServeExport(t *testing.T) {
 	if want := http.StatusOK; w.Code != want {
 		t.Errorf("serveExport = %d; want %d", w.Code, want)
 	}
-	wantOutput := `{"Short":"a","Long":"","Created":"0001-01-01T00:00:00Z","LastEdit":"0001-01-01T00:00:00Z","Owner":"a@example.com"}
-{"Short":"foo","Long":"","Created":"0001-01-01T00:00:00Z","LastEdit":"0001-01-01T00:00:00Z","Owner":"foo@example.com"}
-{"Short":"link-owned-by-tagged-devices","Long":"/before","Created":"0001-01-01T00:00:00Z","LastEdit":"0001-01-01T00:00:00Z","Owner":"tagged-devices"}
+	wantOutput := `{"Short":"a","Long":"","Pattern":"","Created":"0001-01-01T00:00:00Z","LastEdit":"0001-01-01T00:00:00Z","Owner":"a@example.com"}
+{"Short":"foo","Long":"","Pattern":"","Created":"0001-01-01T00:00:00Z","LastEdit":"0001-01-01T00:00:00Z","Owner":"foo@example.com"}
+{"Short":"link-owned-by-tagged-devices","Long":"/before","Pattern":"","Created":"0001-01-01T00:00:00Z","LastEdit":"0001-01-01T00:00:00Z","Owner":"tagged-devices"}
 `
 	if got := w.Body.String(); got != wantOutput {
 		t.Errorf("serveExport = %v; want %v", got, wantOutput)
@@ -1210,10 +1457,11 @@ func TestResolveLink(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	db.Save(&Link{Short: "meet", Long: "https://meet.google.com/lookup/"})
-	db.Save(&Link{Short: "cs", Long: "http://codesearch/{{with .Path}}search?q={{.}}{{end}}"})
-	db.Save(&Link{Short: "m", Long: "http://go/meet"})
-	db.Save(&Link{Short: "chat", Long: "/meet"})
+	db.Save(&Link{Short: "meet", Long: "https://meet.google.com/lookup/", Pattern: "https://meet.google.com/lookup/{{.Path}}"})
+	db.Save(&Link{Short: "cs", Pattern: "http://codesearch/{{with .Path}}search?q={{.}}{{end}}"})
+	// Aliases forward the rest of the path through a pattern of their own.
+	db.Save(&Link{Short: "m", Long: "http://go/meet", Pattern: "http://go/meet/{{.Path}}"})
+	db.Save(&Link{Short: "chat", Long: "/meet", Pattern: "/meet/{{.Path}}"})
 
 	tests := []struct {
 		link string
