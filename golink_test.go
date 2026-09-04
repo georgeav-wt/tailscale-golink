@@ -837,6 +837,32 @@ func TestServeSavePattern(t *testing.T) {
 			wantPattern: "https://jira/browse/{{.Path}}",
 		},
 		{
+			// What the forms send: a marker saying the checkbox is present.
+			name:        "dynamic ticked",
+			short:       "ticked",
+			form:        url.Values{"long": {"https://a/"}, "dynamicset": {"1"}, "dynamic": {"1"}, "pattern": {"https://a/{{.Path}}"}},
+			wantStatus:  http.StatusOK,
+			wantLong:    "https://a/",
+			wantPattern: "https://a/{{.Path}}",
+		},
+		{
+			// The field is hidden rather than disabled, so it arrives even
+			// when the checkbox says the link is not dynamic.
+			name:       "dynamic unticked with a pattern still in the form",
+			short:      "unticked",
+			form:       url.Values{"long": {"https://a/"}, "dynamicset": {"1"}, "pattern": {"https://a/{{.Path}}"}},
+			wantStatus: http.StatusOK,
+			wantLong:   "https://a/",
+		},
+		{
+			// A template cannot be a destination, and the form said this link
+			// has no pattern, so there is nowhere for it to go.
+			name:       "dynamic unticked with a template in the destination",
+			short:      "unticked2",
+			form:       url.Values{"long": {"https://a/{{.Path}}"}, "dynamicset": {"1"}},
+			wantStatus: http.StatusBadRequest,
+		},
+		{
 			name:       "template in the destination alongside a pattern",
 			short:      "both",
 			form:       url.Values{"long": {"https://a/{{.Path}}"}, "pattern": {"https://b/{{.Path}}"}},

@@ -6,6 +6,11 @@
       {{ if .Query }}<a class="flex items-center px-4 my-2 text-sm text-blue-600 hover:underline" href="/.all">Show all links</a>{{ end }}
     </form>
 
+    <p class="text-sm text-gray-500">
+      <a class="text-blue-600 hover:underline" href="/">{{go}}/ home</a> &middot;
+      <a class="text-blue-600 hover:underline" href="/.help">Help and special links</a>
+    </p>
+
     <h2 class="text-xl font-bold pt-2 pb-2">{{ if .Query }}Results for &ldquo;{{ .Query }}&rdquo; ({{ len .Results }} total){{ else }}Results ({{ len .Results }} total){{ end }}</h2>
     <table class="table-auto w-full max-w-screen-lg">
       <thead class="border-b border-gray-200 uppercase text-xs text-gray-500 text-left">

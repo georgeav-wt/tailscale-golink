@@ -34,7 +34,7 @@ In simple cases, the destination link is an absolute URL, such as <strong>https:
 <h2>Resolving links</h2>
 
 <p>
-When logged in to your Tailscale network, {{go}} links can be entered directly into any browser or command line utility such as curl.
+Once signed in, {{go}} links can be entered directly into any browser or command line utility such as curl.
 You do not need any additional browser extensions.
 
 <p>
@@ -68,8 +68,7 @@ Patterns are provided a data structure with the following fields:
   <li><code>.Path</code> is the remaining path value after the short name (without a leading slash).
     For the link <strong>{{go}}/who/amelie</strong>, the value of <code>.Path</code> is <code>amelie</code>.
   <li><code>.Now</code> is a <a href="https://pkg.go.dev/time#Time">time.Time</a> value representing the current date and time.
-  <li><code>.User</code> is the current user resolving the link.
-    This is the email address of the user or <code>{username}@github</code> for tailnets that use GitHub authentication.
+  <li><code>.User</code> is the current user resolving the link, as the email address they signed in with.
 </ul>
 
 Templates also have access to the following template functions:
@@ -147,6 +146,65 @@ The destination is what spares the pattern from having to test whether
   </table>
 </div>
 
+<h2 id="special">Special links</h2>
+
+<p>
+Every {{go}} URL beginning with a dot is {{go}} itself rather than a link, which is why
+each part of a link&rsquo;s name has to start with a letter or number.
+
+<div class="overflow-auto">
+  <table>
+    <tr>
+      <td><a href="/">{{go}}/</a></td>
+      <td>Create a link, and see the most visited ones</td>
+    </tr>
+    <tr>
+      <td><a href="/.all">{{go}}/.all</a></td>
+      <td>Every link, with a box to search them and an edit link for each</td>
+    </tr>
+    <tr>
+      <td>{{go}}/.search?q=<em>text</em></td>
+      <td>Links whose name, destination or pattern contains <em>text</em></td>
+    </tr>
+    <tr>
+      <td>{{go}}/.search?q=owner:<em>amelie@example.com</em></td>
+      <td>Links owned by one person</td>
+    </tr>
+    <tr>
+      <td>{{go}}/.detail/<em>name</em></td>
+      <td>A link&rsquo;s details, where it can be edited or deleted</td>
+    </tr>
+    <tr>
+      <td>{{go}}/<em>name</em>+</td>
+      <td>The same page, for typing in a hurry</td>
+    </tr>
+    <tr>
+      <td><a href="/.export">{{go}}/.export</a></td>
+      <td>Every link as JSON Lines, which is the format a snapshot is restored from</td>
+    </tr>
+    <tr>
+      <td><a href="/.export-stats">{{go}}/.export-stats</a></td>
+      <td>Visit counts as CSV: name, day, visits</td>
+    </tr>
+    <tr>
+      <td><a href="/.help">{{go}}/.help</a></td>
+      <td>This page</td>
+    </tr>
+    <tr>
+      <td><a href="/.metrics">{{go}}/.metrics</a></td>
+      <td><a href="https://prometheus.io/docs/instrumenting/exposition_formats/">Prometheus</a> metrics: total links, and visits per link</td>
+    </tr>
+    <tr>
+      <td>{{go}}/.opensearch</td>
+      <td>A <a href="https://developer.mozilla.org/en-US/docs/Web/XML/Guides/OpenSearch">search engine description</a>, so that a browser can be taught to search {{go}} from its address bar</td>
+    </tr>
+  </table>
+</div>
+
+<p>
+Deleting a link is a form on its detail page rather than a link of its own, since it
+takes a POST and a token to do.
+
 <h2 id="api">Application Programming Interface (API)</h2>
 
 <p>
@@ -158,7 +216,8 @@ Include a "+" after a link to get information about a link without resolving it:
 <pre>$ curl -L {{go}}/search+
 {{`{
 "Short": "search",
-"Long": "https://cloudsearch.google.com/{{if .Path}}cloudsearch/search?q={{QueryEscape .Path}}{{end}}",
+"Long": "https://cloudsearch.google.com/",
+"Pattern": "https://cloudsearch.google.com/cloudsearch/search?q={{QueryEscape .Path}}",
 "Created": "2022-06-08T04:27:32.829906577Z",
 "LastEdit": "2022-06-13T04:42:08.396702416Z",
 "Owner": "amelie@company.com",
@@ -171,8 +230,8 @@ Visit <a href="/.export">{{go}}/.export</a> to export all saved links and their 
 This is useful to create data snapshots that can be restored later.
 
 <pre>$ curl -L {{go}}/.export
-{{`{"Short":"go","Long":"http://go","Created":"2022-05-31T13:04:44.741457796-07:00","LastEdit":"2022-05-31T13:04:44.741457796-07:00","Owner":"amelie@example.com","Clicks":1}
-{"Short":"slack","Long":"https://company.slack.com/{{if .Path}}channels/{{PathEscape .Path}}{{end}}","Created":"2022-06-17T18:05:43.562948451Z","LastEdit":"2022-06-17T18:06:35.811398Z","Owner":"amelie@example.com","Clicks":4}`}}
+{{`{"Short":"go","Long":"http://go","Pattern":"","Created":"2022-05-31T13:04:44.741457796-07:00","LastEdit":"2022-05-31T13:04:44.741457796-07:00","Owner":"amelie@example.com","Clicks":1}
+{"Short":"slack","Long":"https://company.slack.com/","Pattern":"https://company.slack.com/channels/{{PathEscape .Path}}","Created":"2022-06-17T18:05:43.562948451Z","LastEdit":"2022-06-17T18:06:35.811398Z","Owner":"amelie@example.com","Clicks":4}`}}
 </pre>
 
 <p>

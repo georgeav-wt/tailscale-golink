@@ -1220,10 +1220,18 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	short, long, pattern := r.FormValue("short"), r.FormValue("long"), r.FormValue("pattern")
-	if pattern == "" && strings.Contains(long, "{{") {
-		// A template in the destination is how a link used to say that it
-		// answered for the paths below its name. Keep understanding clients
-		// that predate the pattern field.
+	if r.FormValue("dynamicset") != "" {
+		// The form carries a "dynamic link" checkbox and has spoken. Unticked
+		// means the link has no pattern, whatever is still sitting in the
+		// pattern field: it is hidden with CSS rather than disabled, so it is
+		// submitted either way.
+		if r.FormValue("dynamic") == "" {
+			pattern = ""
+		}
+	} else if pattern == "" && strings.Contains(long, "{{") {
+		// Nothing said, and there is a template in the destination, which is
+		// how a link used to say that it answered for the paths below its
+		// name. Keep understanding clients that predate the pattern field.
 		long, pattern = legacyPattern(long, true)
 	}
 	if short == "" || (long == "" && pattern == "") {
