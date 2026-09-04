@@ -1584,6 +1584,11 @@ func TestServeSearch(t *testing.T) {
 		{Short: "beta", Long: "http://beta/", Owner: "foo@example.com"},
 		{Short: "gamma", Long: "http://gamma/", Owner: "bar@example.com"},
 		{Short: "delta", Long: "http://delta/", Owner: "FOO@example.com"},
+		{Short: "bob", Long: "https://bob.example.com/"},
+		{Short: "hi-bob", Long: "https://directory/bob"},
+		{Short: "hr", Long: "https://app.hibob.com/"},
+		{Short: "ticket", Pattern: "https://bob.example.com/t/{{.Path}}"},
+		{Short: "100%", Long: "https://percent/"},
 	}
 	for _, link := range links {
 		if err := db.Save(link); err != nil {
@@ -1593,53 +1598,107 @@ func TestServeSearch(t *testing.T) {
 
 	tests := []struct {
 		name            string
-		owner           string
+		query           string
 		wantStatus      int
+		wantLocation    string
 		wantContains    []string // substrings that should appear in response body
 		wantNotContains []string // substrings that should NOT appear in response body
 	}{
 		{
 			name:            "search by owner with multiple links",
-			owner:           "foo@example.com",
+			query:           "owner:foo@example.com",
 			wantStatus:      http.StatusOK,
 			wantContains:    []string{"alpha", "beta", "delta", "3 total"},
 			wantNotContains: []string{"gamma"},
 		},
 		{
 			name:         "search by owner case insensitive",
-			owner:        "FOO@EXAMPLE.COM",
+			query:        "owner:FOO@EXAMPLE.COM",
 			wantStatus:   http.StatusOK,
 			wantContains: []string{"alpha", "beta", "delta"},
 		},
 		{
 			name:            "search by owner with single link",
-			owner:           "bar@example.com",
+			query:           "owner:bar@example.com",
 			wantStatus:      http.StatusOK,
 			wantContains:    []string{"gamma", "1 total"},
 			wantNotContains: []string{"alpha", "beta"},
+		},
+		{
+			// A name, a name containing the query, and a destination
+			// containing it, all at once.
+			name:            "search names and destinations",
+			query:           "bob",
+			wantStatus:      http.StatusOK,
+			wantContains:    []string{"go/bob", "go/hi-bob", "go/hr", "go/ticket", "4 total"},
+			wantNotContains: []string{"go/alpha"},
+		},
+		{
+			name:         "search without regard to case",
+			query:        "BOB",
+			wantStatus:   http.StatusOK,
+			wantContains: []string{"go/bob", "go/hr"},
+		},
+		{
+			// Dashes are ignored when resolving a link, so they are ignored
+			// when searching for one too.
+			name:         "search ignoring dashes",
+			query:        "hibob",
+			wantStatus:   http.StatusOK,
+			wantContains: []string{"go/hi-bob", "go/hr"},
+		},
+		{
+			name:         "search matching a pattern",
+			query:        "t/{{.Path}}",
+			wantStatus:   http.StatusOK,
+			wantContains: []string{"go/ticket", "1 total"},
+		},
+		{
+			// A LIKE wildcard in the query matches itself, not everything.
+			name:            "search for a percent sign",
+			query:           "100%",
+			wantStatus:      http.StatusOK,
+			wantContains:    []string{"go/100%", "1 total"},
+			wantNotContains: []string{"go/alpha"},
+		},
+		{
+			name:         "no match",
+			query:        "nothing-matches-this",
+			wantStatus:   http.StatusOK,
+			wantContains: []string{"0 total", "No link"},
+		},
+		{
+			name:         "empty query",
+			query:        "  ",
+			wantStatus:   http.StatusFound,
+			wantLocation: "/.all",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			testURL := "/.search?q=owner:" + url.QueryEscape(tt.owner)
-			r := httptest.NewRequest("GET", testURL, nil)
+			r := httptest.NewRequest("GET", "/.search?q="+url.QueryEscape(tt.query), nil)
 			w := httptest.NewRecorder()
 			serveHandler().ServeHTTP(w, r)
 
 			if w.Code != tt.wantStatus {
-				t.Errorf("serveSearch(owner=%q) = %d; want %d", tt.owner, w.Code, tt.wantStatus)
+				t.Errorf("serveSearch(%q) = %d; want %d", tt.query, w.Code, tt.wantStatus)
+			}
+			if tt.wantLocation != "" {
+				if got := w.Header().Get("Location"); got != tt.wantLocation {
+					t.Errorf("serveSearch(%q) Location = %q; want %q", tt.query, got, tt.wantLocation)
+				}
 			}
 
 			body := w.Body.String()
 			for _, s := range tt.wantContains {
 				if !strings.Contains(body, s) {
-					t.Errorf("serveSearch(owner=%q) body missing %q", tt.owner, s)
+					t.Errorf("serveSearch(%q) body missing %q", tt.query, s)
 				}
 			}
 			for _, s := range tt.wantNotContains {
 				if strings.Contains(body, s) {
-					t.Errorf("serveSearch(owner=%q) body unexpectedly contains %q", tt.owner, s)
+					t.Errorf("serveSearch(%q) body unexpectedly contains %q", tt.query, s)
 				}
 			}
 		})

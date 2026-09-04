@@ -132,6 +132,37 @@ func (s *SQLiteDB) Now() time.Time {
 	return tstime.DefaultClock{Clock: s.clock}.Now()
 }
 
+// linkColumns are the columns of the Links table that make up a Link, in the
+// order scanLink reads them.
+const linkColumns = "Short, Long, Pattern, Created, LastEdit, Owner, Locked"
+
+// scanLink reads a single Link from a query result.
+func scanLink(row interface{ Scan(...any) error }) (*Link, error) {
+	link := new(Link)
+	var created, lastEdit int64
+	if err := row.Scan(&link.Short, &link.Long, &link.Pattern, &created, &lastEdit, &link.Owner, &link.Locked); err != nil {
+		return nil, err
+	}
+	link.Created = time.Unix(created, 0).UTC()
+	link.LastEdit = time.Unix(lastEdit, 0).UTC()
+	return link, nil
+}
+
+// scanLinks reads every Link from a query result and closes it.
+func scanLinks(rows *sql.Rows) ([]*Link, error) {
+	defer rows.Close()
+
+	var links []*Link
+	for rows.Next() {
+		link, err := scanLink(rows)
+		if err != nil {
+			return nil, err
+		}
+		links = append(links, link)
+	}
+	return links, rows.Err()
+}
+
 // LoadAll returns all stored Links.
 //
 // The caller owns the returned values.
@@ -139,23 +170,11 @@ func (s *SQLiteDB) LoadAll() ([]*Link, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var links []*Link
-	rows, err := s.db.Query("SELECT Short, Long, Pattern, Created, LastEdit, Owner, Locked FROM Links")
+	rows, err := s.db.Query("SELECT " + linkColumns + " FROM Links")
 	if err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		link := new(Link)
-		var created, lastEdit int64
-		err := rows.Scan(&link.Short, &link.Long, &link.Pattern, &created, &lastEdit, &link.Owner, &link.Locked)
-		if err != nil {
-			return nil, err
-		}
-		link.Created = time.Unix(created, 0).UTC()
-		link.LastEdit = time.Unix(lastEdit, 0).UTC()
-		links = append(links, link)
-	}
-	return links, rows.Err()
+	return scanLinks(rows)
 }
 
 // Load returns a Link by its short name.
@@ -167,18 +186,14 @@ func (s *SQLiteDB) Load(short string) (*Link, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	link := new(Link)
-	var created, lastEdit int64
-	row := s.db.QueryRow("SELECT Short, Long, Pattern, Created, LastEdit, Owner, Locked FROM Links WHERE ID = ?1 LIMIT 1", linkID(short))
-	err := row.Scan(&link.Short, &link.Long, &link.Pattern, &created, &lastEdit, &link.Owner, &link.Locked)
+	row := s.db.QueryRow("SELECT "+linkColumns+" FROM Links WHERE ID = ?1 LIMIT 1", linkID(short))
+	link, err := scanLink(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			err = fs.ErrNotExist
 		}
 		return nil, err
 	}
-	link.Created = time.Unix(created, 0).UTC()
-	link.LastEdit = time.Unix(lastEdit, 0).UTC()
 	return link, nil
 }
 
@@ -335,21 +350,44 @@ func (s *SQLiteDB) GetLinksByOwner(owner string) ([]*Link, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	var links []*Link
-	rows, err := s.db.Query("SELECT Short, Long, Pattern, Created, LastEdit, Owner, Locked FROM Links WHERE LOWER(Owner) = LOWER(?)", owner)
+	rows, err := s.db.Query("SELECT "+linkColumns+" FROM Links WHERE LOWER(Owner) = LOWER(?)", owner)
 	if err != nil {
 		return nil, err
 	}
-	for rows.Next() {
-		link := new(Link)
-		var created, lastEdit int64
-		err := rows.Scan(&link.Short, &link.Long, &link.Pattern, &created, &lastEdit, &link.Owner, &link.Locked)
-		if err != nil {
-			return nil, err
-		}
-		link.Created = time.Unix(created, 0).UTC()
-		link.LastEdit = time.Unix(lastEdit, 0).UTC()
-		links = append(links, link)
+	return scanLinks(rows)
+}
+
+// SearchLinks returns all Links whose short name, destination or pattern
+// contains query, matched without regard to case. Dashes are ignored in the
+// short name, as they are when resolving a link, so that "meetingnotes" finds
+// "meeting-notes".
+func (s *SQLiteDB) SearchLinks(query string) ([]*Link, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(`SELECT `+linkColumns+` FROM Links WHERE
+		Short LIKE ?1 ESCAPE '\' OR
+		Long LIKE ?1 ESCAPE '\' OR
+		Pattern LIKE ?1 ESCAPE '\' OR
+		ID LIKE ?2 ESCAPE '\'`,
+		containsPattern(query), containsPattern(linkID(query)))
+	if err != nil {
+		return nil, err
 	}
-	return links, rows.Err()
+	return scanLinks(rows)
+}
+
+// containsPattern returns a SQL LIKE pattern matching any string that contains
+// s, with the wildcards LIKE would otherwise read in s escaped.
+func containsPattern(s string) string {
+	var b strings.Builder
+	b.WriteByte('%')
+	for _, r := range s {
+		if r == '\\' || r == '%' || r == '_' {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	b.WriteByte('%')
+	return b.String()
 }

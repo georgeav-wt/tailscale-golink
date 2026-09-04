@@ -352,6 +352,14 @@ type searchResult struct {
 	NumClicks int
 }
 
+// searchData is the data used by the searchTmpl template.
+type searchData struct {
+	// Query is the search these results answer, empty when every link is
+	// listed.
+	Query   string
+	Results []searchResult
+}
+
 // searchResults annotates links with their current click counts (read from the
 // live in-memory counter, the same source the home page uses), preserving the
 // historical alphabetical ordering by short name.
@@ -636,7 +644,7 @@ func serveAll(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
-	searchTmpl.Execute(w, searchResults(links))
+	searchTmpl.Execute(w, searchData{Results: searchResults(links)})
 }
 
 func serveHelp(w http.ResponseWriter, _ *http.Request) {
@@ -817,22 +825,29 @@ func serveDetail(w http.ResponseWriter, r *http.Request) {
 	detailTmpl.Execute(w, data)
 }
 
-// serveSearch handles requests to /.search?q={query}, where {query} can currently only be
-// the owner formated like "owner:<email>".
+// serveSearch handles requests to /.search?q={query}. A query of
+// "owner:<email>" lists the links owned by that user; anything else lists the
+// links whose short name, destination or pattern contains it.
 func serveSearch(w http.ResponseWriter, r *http.Request) {
-	query := r.URL.Query().Get("q")
-	owner, found := strings.CutPrefix(query, "owner:")
-	if !found {
-		http.Error(w, `search only supports "owner:<email>"`, http.StatusBadRequest)
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		http.Redirect(w, r, "/.all", http.StatusFound)
 		return
 	}
-	links, err := db.GetLinksByOwner(owner)
+
+	var links []*Link
+	var err error
+	if owner, found := strings.CutPrefix(query, "owner:"); found {
+		links, err = db.GetLinksByOwner(strings.TrimSpace(owner))
+	} else {
+		links, err = db.SearchLinks(query)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	searchTmpl.Execute(w, searchResults(links))
+	searchTmpl.Execute(w, searchData{Query: query, Results: searchResults(links)})
 }
 
 type expandEnv struct {
