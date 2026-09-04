@@ -2,6 +2,13 @@
     {{ if .ReadOnly }}
       <p class="rounded-md py-3 px-4 bg-orange-0 border border-orange-50">{{go}} is running in read-only mode. Links can be resolved, but not created or updated.</p>
     {{ else }}
+      {{ if .Suggestions }}
+      <div class="py-2 px-4 mb-6 rounded-md border text-sm border-orange-50 bg-orange-0 text-gray-700">
+        There is no {{go}}/{{.Short}}. Did you mean
+        {{ range $i, $link := .Suggestions }}{{ if $i }}, {{ end }}<a class="text-blue-600 hover:underline" href="/{{$link.Short}}">{{go}}/{{$link.Short}}</a>{{ end }}?
+      </div>
+      {{ end }}
+
       <h2 class="text-xl font-bold pb-2">Create a new link</h2>
 
       {{ with .Long }}

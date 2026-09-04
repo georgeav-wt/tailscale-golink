@@ -1858,14 +1858,15 @@ func TestSearchResults(t *testing.T) {
 		stats.mu.Unlock()
 	})
 
+	day := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
 	links := []*Link{
-		{Short: "alpha"},
-		{Short: "beta"},
-		{Short: "gamma"}, // no recorded clicks; should annotate to 0
+		{Short: "alpha", Owner: "z@example.com", LastEdit: day},
+		{Short: "beta", Owner: "a@example.com", LastEdit: day.AddDate(0, 0, 1)},
+		{Short: "gamma", Owner: "m@example.com", LastEdit: day.AddDate(0, 0, 2)}, // no recorded clicks; should annotate to 0
 	}
 
-	// Expect the historical alphabetical ordering by short name, with each
-	// link annotated with its current click count.
+	// The default order is alphabetical by short name, with each link
+	// annotated with its current click count.
 	want := []struct {
 		Short     string
 		NumClicks int
@@ -1875,7 +1876,7 @@ func TestSearchResults(t *testing.T) {
 		{Short: "gamma", NumClicks: 0},
 	}
 
-	got := searchResults(links)
+	got := searchResults(links, "")
 	if len(got) != len(want) {
 		t.Fatalf("searchResults returned %d results; want %d", len(got), len(want))
 	}
@@ -1883,6 +1884,68 @@ func TestSearchResults(t *testing.T) {
 		if got[i].Short != w.Short || got[i].NumClicks != w.NumClicks {
 			t.Errorf("result[%d] = {%q, %d}; want {%q, %d}", i, got[i].Short, got[i].NumClicks, w.Short, w.NumClicks)
 		}
+	}
+
+	// Every other order, each with the direction that is useful for it.
+	for _, tt := range []struct {
+		order string
+		want  []string
+	}{
+		{order: "name", want: []string{"alpha", "beta", "gamma"}},
+		{order: "owner", want: []string{"beta", "gamma", "alpha"}},
+		{order: "clicks", want: []string{"beta", "alpha", "gamma"}},
+		{order: "edited", want: []string{"gamma", "beta", "alpha"}},
+		{order: "nonsense", want: []string{"alpha", "beta", "gamma"}},
+	} {
+		got := searchResults(links, tt.order)
+		var names []string
+		for _, r := range got {
+			names = append(names, r.Short)
+		}
+		if !slices.Equal(names, tt.want) {
+			t.Errorf("searchResults order %q = %v; want %v", tt.order, names, tt.want)
+		}
+	}
+}
+
+func TestSuggestLinks(t *testing.T) {
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, short := range []string{"hibob", "hr", "gh", "gh/infra", "gh/infrastructure", "team/jira", "team/github", "wiki"} {
+		if err := db.Save(&Link{Short: short, Long: "http://example.com/" + short}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		name  string
+		short string
+		want  []string
+	}{
+		{name: "no name at all", short: "", want: nil},
+		{name: "one letter too many", short: "hibbob", want: []string{"hibob"}},
+		{name: "one letter missing", short: "hibo", want: []string{"hibob"}},
+		{name: "dashes are ignored, as they are when resolving", short: "hi-bob", want: nil},
+		{name: "a name typed short", short: "gh/inf", want: []string{"gh", "gh/infra", "gh/infrastructure"}},
+		{name: "siblings under the same name", short: "team/confluence", want: []string{"team/github", "team/jira"}},
+		{name: "nothing like it", short: "zzzzzzzz", want: nil},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var got []string
+			for _, link := range suggestLinks(tt.short) {
+				got = append(got, link.Short)
+			}
+			slices.Sort(got)
+			slices.Sort(tt.want)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("suggestLinks(%q) = %v; want %v", tt.short, got, tt.want)
+			}
+		})
 	}
 }
 

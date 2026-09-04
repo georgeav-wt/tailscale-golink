@@ -357,14 +357,51 @@ type searchResult struct {
 type searchData struct {
 	// Query is the search these results answer, empty when every link is
 	// listed.
-	Query   string
+	Query string
+	// Sort is the order the results are in, one of the sortOrders keys.
+	Sort    string
 	Results []searchResult
+}
+
+// SortLink returns the URL of these same results in another order, for the
+// column headings to link to.
+func (d searchData) SortLink(order string) string {
+	values := url.Values{}
+	path := "/.all"
+	if d.Query != "" {
+		path = "/.search"
+		values.Set("q", d.Query)
+	}
+	values.Set("sort", order)
+	return path + "?" + values.Encode()
+}
+
+// sortOrders are the orders results can be listed in, each with the direction
+// that is useful for it: names read alphabetically, while for clicks and dates
+// the interesting end is the top.
+var sortOrders = map[string]func(a, b searchResult) bool{
+	"name":  func(a, b searchResult) bool { return a.Short < b.Short },
+	"owner": func(a, b searchResult) bool { return a.Owner < b.Owner || (a.Owner == b.Owner && a.Short < b.Short) },
+	"clicks": func(a, b searchResult) bool {
+		return a.NumClicks > b.NumClicks || (a.NumClicks == b.NumClicks && a.Short < b.Short)
+	},
+	"edited": func(a, b searchResult) bool {
+		return a.LastEdit.After(b.LastEdit) || (a.LastEdit.Equal(b.LastEdit) && a.Short < b.Short)
+	},
+}
+
+// sortOrder returns the name of a valid order, defaulting to by name.
+func sortOrder(order string) string {
+	if _, ok := sortOrders[order]; ok {
+		return order
+	}
+	return "name"
 }
 
 // searchResults annotates links with their current click counts (read from the
 // live in-memory counter, the same source the home page uses), preserving the
 // historical alphabetical ordering by short name.
-func searchResults(links []*Link) []searchResult {
+func searchResults(links []*Link, order string) []searchResult {
 	stats.mu.Lock()
 	results := make([]searchResult, len(links))
 	for i, link := range links {
@@ -372,9 +409,8 @@ func searchResults(links []*Link) []searchResult {
 	}
 	stats.mu.Unlock()
 
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Short < results[j].Short
-	})
+	less := sortOrders[sortOrder(order)]
+	sort.Slice(results, func(i, j int) bool { return less(results[i], results[j]) })
 	return results
 }
 
@@ -386,6 +422,9 @@ type homeData struct {
 	XSRF     string
 	ReadOnly bool
 	User     string
+	// Suggestions are links resembling the name that was asked for and did
+	// not exist, offered above the form that would create it.
+	Suggestions []*Link
 }
 
 // deleteData is the data used by deleteTmpl.
@@ -624,16 +663,17 @@ func serveHome(w http.ResponseWriter, r *http.Request, short string) {
 		return
 	}
 	homeTmpl.Execute(w, homeData{
-		Short:    short,
-		Long:     long,
-		Clicks:   clicks,
-		XSRF:     xsrftoken.Generate(xsrfKey, cu.login, newShortName),
-		ReadOnly: *readonly,
-		User:     cu.login,
+		Short:       short,
+		Long:        long,
+		Clicks:      clicks,
+		XSRF:        xsrftoken.Generate(xsrfKey, cu.login, newShortName),
+		ReadOnly:    *readonly,
+		User:        cu.login,
+		Suggestions: suggestLinks(short),
 	})
 }
 
-func serveAll(w http.ResponseWriter, _ *http.Request) {
+func serveAll(w http.ResponseWriter, r *http.Request) {
 	if err := flushStats(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -645,7 +685,8 @@ func serveAll(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
-	searchTmpl.Execute(w, searchData{Results: searchResults(links)})
+	order := sortOrder(r.URL.Query().Get("sort"))
+	searchTmpl.Execute(w, searchData{Sort: order, Results: searchResults(links, order)})
 }
 
 func serveHelp(w http.ResponseWriter, _ *http.Request) {
@@ -755,6 +796,110 @@ func serveGo(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusFound)
 }
 
+// maxSuggestions is how many near misses are worth offering; more than a few
+// and reading them is slower than typing the name again.
+const maxSuggestions = 5
+
+// suggestLinks returns the links whose names most resemble short, for a name
+// that was asked for and does not exist. It returns nothing for an empty name,
+// which is the home page rather than a link that was missed.
+func suggestLinks(short string) []*Link {
+	if short == "" {
+		return nil
+	}
+	links, err := db.LoadAll()
+	if err != nil {
+		log.Printf("loading links to suggest for %q: %v", short, err)
+		return nil
+	}
+
+	// Compare normalised names, so that a suggestion differs from what was
+	// asked for in the way that resolving a link would notice, rather than in
+	// case or in dashes, which it would not.
+	want := linkID(short)
+	type scored struct {
+		link  *Link
+		score int
+	}
+	var candidates []scored
+	for _, link := range links {
+		id := linkID(link.Short)
+		if id == want {
+			continue // it exists after all; not a miss
+		}
+		score := -1
+		switch {
+		case strings.HasPrefix(id, want) || strings.HasPrefix(want, id):
+			// A name typed short, or one segment of a longer name: asking for
+			// go/gh when go/gh/infra exists, or the other way around.
+			score = 0
+		case editDistance(id, want) <= 1:
+			score = 1
+		case len(want) >= 4 && editDistance(id, want) <= 2:
+			score = 2
+		case sameFirstSegment(link.Short, short):
+			// A sibling under the same name: go/team/nothing suggests the
+			// other links under go/team.
+			score = 3
+		case strings.Contains(id, want) || strings.Contains(want, id):
+			score = 4
+		}
+		if score >= 0 {
+			candidates = append(candidates, scored{link, score})
+		}
+	}
+
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score < candidates[j].score
+		}
+		return candidates[i].link.Short < candidates[j].link.Short
+	})
+	if len(candidates) > maxSuggestions {
+		candidates = candidates[:maxSuggestions]
+	}
+
+	suggestions := make([]*Link, 0, len(candidates))
+	for _, c := range candidates {
+		suggestions = append(suggestions, c.link)
+	}
+	return suggestions
+}
+
+// sameFirstSegment returns whether two names share a first path segment, and
+// have more than that one segment between them.
+func sameFirstSegment(a, b string) bool {
+	first, _, aMore := strings.Cut(a, "/")
+	second, _, bMore := strings.Cut(b, "/")
+	if !aMore && !bMore {
+		return false
+	}
+	return linkID(first) == linkID(second)
+}
+
+// editDistance returns the number of single-character insertions, deletions
+// and substitutions that turn a into b.
+func editDistance(a, b string) int {
+	// Only the previous row of the matrix is needed to compute the next.
+	previous := make([]int, len(b)+1)
+	current := make([]int, len(b)+1)
+	for j := range previous {
+		previous[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		current[0] = i
+		for j := 1; j <= len(b); j++ {
+			cost := 1
+			if a[i-1] == b[j-1] {
+				cost = 0
+			}
+			current[j] = min(previous[j]+1, min(current[j-1]+1, previous[j-1]+cost))
+		}
+		previous, current = current, previous
+	}
+	return previous[len(b)]
+}
+
 // acceptHTML returns whether the request can accept a text/html response.
 func acceptHTML(r *http.Request) bool {
 	return strings.Contains(strings.ToLower(r.Header.Get("Accept")), "text/html")
@@ -848,7 +993,8 @@ func serveSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	searchTmpl.Execute(w, searchData{Query: query, Results: searchResults(links)})
+	order := sortOrder(r.URL.Query().Get("sort"))
+	searchTmpl.Execute(w, searchData{Query: query, Sort: order, Results: searchResults(links, order)})
 }
 
 type expandEnv struct {
