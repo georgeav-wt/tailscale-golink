@@ -425,6 +425,11 @@ type homeData struct {
 	// Suggestions are links resembling the name that was asked for and did
 	// not exist, offered above the form that would create it.
 	Suggestions []*Link
+
+	// Pattern and AddedScheme are for the page shown after saving: what the
+	// link now points at, and whether a scheme had to be supplied to get there.
+	Pattern     string
+	AddedScheme bool
 }
 
 // deleteData is the data used by deleteTmpl.
@@ -1068,6 +1073,55 @@ func expandLink(long string, env expandEnv) (*url.URL, error) {
 	return u, nil
 }
 
+// withScheme returns a destination with a scheme, assuming https when one was
+// left off.
+//
+// A destination without a scheme is a relative URL, which a browser resolves
+// against golink itself, so a link pointing at "g.co/test" lands the visitor on
+// http://go/g.co/test rather than on Google. Someone writing that meant the
+// scheme to be there.
+//
+// Two kinds of destination are left alone. One beginning with "/" is how a link
+// aliases another link, which resolveLink follows on purpose. One beginning with
+// a template decides its own scheme when it is expanded, and there is nothing
+// here to inspect.
+//
+// A destination that really is served over plain http still works: write the
+// http:// out and this leaves it alone.
+func withScheme(dest string) string {
+	if dest == "" || strings.HasPrefix(dest, "/") || strings.HasPrefix(dest, "{{") {
+		return dest
+	}
+	if hasScheme(dest) {
+		return dest
+	}
+	return "https://" + dest
+}
+
+// rePort matches what follows the colon in a host and port, as opposed to what
+// follows the colon in a scheme.
+var rePort = regexp.MustCompile(`^[0-9]+(/|$)`)
+
+// hasScheme reports whether dest begins with a URI scheme. It is not enough to
+// look for a colon: "localhost:8080/x" is a host and a port, and means to be
+// fetched over https, while "mailto:someone@example.com" is a scheme and is not
+// a URL to fetch at all.
+func hasScheme(dest string) bool {
+	scheme, rest, ok := strings.Cut(dest, ":")
+	if !ok || scheme == "" {
+		return false
+	}
+	for i, r := range scheme {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z':
+		case i > 0 && (r >= '0' && r <= '9' || r == '+' || r == '-' || r == '.'):
+		default:
+			return false
+		}
+	}
+	return !rePort.MatchString(rest)
+}
+
 // resolveTarget returns the URL a link points to for a particular request.
 //
 // A link's destination is used exactly as written: nothing is appended to it
@@ -1399,6 +1453,12 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Supply a scheme that was left off, and say so afterwards rather than
+	// changing what somebody wrote without telling them.
+	written := long + pattern
+	long, pattern = withScheme(long), withScheme(pattern)
+	addedScheme := long+pattern != written
+
 	cu, err := requestUser(r)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1514,7 +1574,12 @@ func serveSave(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if acceptHTML(r) {
-		successTmpl.Execute(w, homeData{Short: short})
+		successTmpl.Execute(w, homeData{
+			Short:       short,
+			Long:        link.Long,
+			Pattern:     link.Pattern,
+			AddedScheme: addedScheme,
+		})
 	} else {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(link)

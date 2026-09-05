@@ -2,4 +2,31 @@
     <h2 class="text-xl font-bold pb-2">Success</h2>
 
     <p><a class="text-blue-600 hover:underline" href="/{{.Short}}">{{go}}/{{.Short}}</a> has been saved.</p>
+
+    <dl>
+      {{ with .Long }}
+      <dt class="text-sm font-bold mt-6">Destination</dt>
+      <dd>{{.}}</dd>
+      {{ end }}
+
+      {{ with .Pattern }}
+      <dt class="text-sm font-bold mt-6">Pattern for paths below this link</dt>
+      <dd>{{.}}</dd>
+      {{ end }}
+    </dl>
+
+    {{ if .AddedScheme }}
+    <div class="py-2 px-4 rounded-md border text-sm border-orange-50 bg-orange-0 mt-6 text-gray-700">
+      No scheme was given, so <strong>https://</strong> was added. Without one the
+      destination would have been read as a path under {{go}}/ rather than as another
+      site. If it is only served over plain http, <a class="text-blue-600 hover:underline" href="/.detail/{{.Short}}">edit the link</a>
+      and write the <strong>http://</strong> out.
+    </div>
+    {{ end }}
+
+    <p class="text-sm text-gray-500 mt-4">
+      <a class="text-blue-600 hover:underline" href="/">Create another</a> &middot;
+      <a class="text-blue-600 hover:underline" href="/.detail/{{.Short}}">Edit this link</a> &middot;
+      <a class="text-blue-600 hover:underline" href="/.all">All links</a>
+    </p>
 {{ end }}

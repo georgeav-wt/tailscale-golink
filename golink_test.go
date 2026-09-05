@@ -873,6 +873,27 @@ func TestServeSavePattern(t *testing.T) {
 			wantStatus: http.StatusBadRequest,
 		},
 		{
+			name:       "a destination with no scheme gains one",
+			short:      "scheme",
+			form:       url.Values{"long": {"g.co/test"}},
+			wantStatus: http.StatusOK,
+			wantLong:   "https://g.co/test",
+		},
+		{
+			name:        "a pattern with no scheme gains one",
+			short:       "scheme2",
+			form:        url.Values{"pattern": {"g.co/{{.Path}}"}},
+			wantStatus:  http.StatusOK,
+			wantPattern: "https://g.co/{{.Path}}",
+		},
+		{
+			name:       "an alias of another link keeps its leading slash",
+			short:      "alias",
+			form:       url.Values{"long": {"/scheme"}},
+			wantStatus: http.StatusOK,
+			wantLong:   "/scheme",
+		},
+		{
 			name:       "neither destination nor pattern",
 			short:      "empty",
 			form:       url.Values{},
@@ -1092,6 +1113,44 @@ func TestAuditLog(t *testing.T) {
 
 	if buf.Len() != 0 {
 		t.Errorf("audit log has %d unread bytes: %s", buf.Len(), buf.String())
+	}
+}
+
+func TestWithScheme(t *testing.T) {
+	tests := []struct {
+		name string
+		dest string
+		want string
+	}{
+		{name: "a bare host and path", dest: "g.co/test", want: "https://g.co/test"},
+		{name: "a bare host", dest: "app.hibob.com", want: "https://app.hibob.com"},
+		{name: "https already", dest: "https://g.co/test", want: "https://g.co/test"},
+		{name: "http already, which is left alone", dest: "http://internal-box/admin", want: "http://internal-box/admin"},
+		{name: "an upper-case scheme", dest: "HTTPS://G.CO/", want: "HTTPS://G.CO/"},
+		{name: "nothing at all", dest: "", want: ""},
+
+		// A destination beginning with "/" aliases another link, which
+		// resolveLink follows on purpose.
+		{name: "an alias of another link", dest: "/meet", want: "/meet"},
+
+		// A template decides its own scheme when it is expanded.
+		{name: "a template from the start", dest: "{{if .Path}}https://a/{{else}}https://b/{{end}}", want: "{{if .Path}}https://a/{{else}}https://b/{{end}}"},
+		{name: "a pattern with a bare host", dest: "g.co/{{.Path}}", want: "https://g.co/{{.Path}}"},
+
+		// A colon is not enough to call something a scheme.
+		{name: "a host and a port", dest: "localhost:8080/foo", want: "https://localhost:8080/foo"},
+		{name: "a host and a port, nothing after", dest: "internal:9000", want: "https://internal:9000"},
+		{name: "a scheme that is not http", dest: "mailto:someone@example.com", want: "mailto:someone@example.com"},
+		{name: "a scheme before a digit", dest: "mailto:2fa@example.com", want: "mailto:2fa@example.com"},
+		{name: "an application scheme", dest: "slack://channel?id=1", want: "slack://channel?id=1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := withScheme(tt.dest); got != tt.want {
+				t.Errorf("withScheme(%q) = %q; want %q", tt.dest, got, tt.want)
+			}
+		})
 	}
 }
 
