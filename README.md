@@ -289,6 +289,29 @@ described below; they confer nothing on their own.
 
 [oauth2-proxy]: https://github.com/oauth2-proxy/oauth2-proxy
 
+## Configuration file
+
+Every option can be given in a file instead of on the command line:
+
+    golink -config /etc/golink/golink.hujson
+
+The file names the same options `-help` lists, and is
+[hujson](https://github.com/tailscale/hujson) — JSON, with comments and trailing commas
+allowed:
+
+```hujson
+{
+    // Anyone may edit any link that is not locked.
+    "open-links": true,
+    "sqlitedb": "/home/nonroot/golink.db",
+}
+```
+
+An option given on the command line wins over the file, so a file of settled defaults
+and a one-off override work together. An option name the file gets wrong is an error at
+startup rather than something quietly ignored. `deploy/golink.hujson` is a worked
+example.
+
 ## Permissions
 
 By default, users own the links they create and only they can update or delete those links.

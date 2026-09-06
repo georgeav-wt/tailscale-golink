@@ -1,0 +1,34 @@
+// An example configuration for golink. Every option here is one that -help
+// lists; anything gettable from -help is settable here, and an option given on
+// the command line wins over this file.
+//
+//     golink -config /etc/golink/golink.hujson
+//
+// It is hujson -- JSON, with comments and trailing commas allowed.
+{
+    // Serve plain HTTP on this address rather than joining a tailnet.
+    // Something in front has to authenticate the request; see deploy/nginx/.
+    "dev-listen": ":8080",
+    "sqlitedb": "/home/nonroot/golink.db",
+
+    // Anyone may edit any link that is not locked. Without this, a link
+    // belongs to whoever made it, which is upstream's model.
+    "open-links": true,
+
+    // Locking is an admin decision. Uncomment to let owners lock their own.
+    // "owner-can-lock": true,
+
+    // Who the visitor is, according to the proxy in front. golink cannot tell
+    // these headers from ones a client sent, so nothing but that proxy may be
+    // able to reach golink. Without the first of these, every visitor is the
+    // dev-mode user and every link they create belongs to that name.
+    "auth-email-header": "X-Auth-Request-Email",
+    "auth-groups-header": "X-Auth-Request-Groups",
+
+    // Where to post an audit event. This URL is a credential -- anyone holding
+    // it can post to the channel -- so keep this file readable only by the
+    // user golink runs as, and prefer it to the command line, where the URL
+    // would be visible in the process list.
+    // "webhook-url": "https://hooks.slack.com/services/T000/B000/xxxx",
+    // "webhook-format": "slack",
+}

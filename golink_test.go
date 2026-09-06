@@ -8,10 +8,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -1152,6 +1155,93 @@ func TestWithScheme(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLoadConfig(t *testing.T) {
+	// A set of flags of the shapes a real configuration would set, kept apart
+	// from the process's own so that this cannot disturb another test.
+	newFlags := func() (*flag.FlagSet, *bool, *string, *int) {
+		fs := flag.NewFlagSet("test", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		return fs, fs.Bool("open-links", false, ""), fs.String("sqlitedb", "", ""), fs.Int("port", 0, "")
+	}
+
+	t.Run("a file of settings", func(t *testing.T) {
+		fs, openLinks, sqlitedb, port := newFlags()
+		path := writeConfig(t, `{
+			// Comments and trailing commas are allowed, which is the whole
+			// reason this is hujson rather than json.
+			"open-links": true,
+			"sqlitedb": "/home/nonroot/golink.db",
+			"port": 8080,
+		}`)
+		if err := loadConfig(fs, path); err != nil {
+			t.Fatal(err)
+		}
+		if !*openLinks || *sqlitedb != "/home/nonroot/golink.db" || *port != 8080 {
+			t.Errorf("after loadConfig: open-links=%v sqlitedb=%q port=%d", *openLinks, *sqlitedb, *port)
+		}
+	})
+
+	t.Run("the command line wins", func(t *testing.T) {
+		fs, openLinks, sqlitedb, _ := newFlags()
+		if err := fs.Parse([]string{"-sqlitedb", "/tmp/other.db"}); err != nil {
+			t.Fatal(err)
+		}
+		path := writeConfig(t, `{"open-links": true, "sqlitedb": "/home/nonroot/golink.db"}`)
+		if err := loadConfig(fs, path); err != nil {
+			t.Fatal(err)
+		}
+		if *sqlitedb != "/tmp/other.db" {
+			t.Errorf("sqlitedb = %q; want the value from the command line", *sqlitedb)
+		}
+		if !*openLinks {
+			t.Error("open-links was not taken from the file, though the command line did not name it")
+		}
+	})
+
+	for _, tt := range []struct {
+		name    string
+		config  string
+		wantErr string
+	}{
+		{name: "a misspelled option", config: `{"open-lynx": true}`, wantErr: `no such option "open-lynx"`},
+		{name: "a value of the wrong shape", config: `{"open-links": "yes please"}`, wantErr: `option "open-links"`},
+		{name: "a setting with no value", config: `{"sqlitedb": null}`, wantErr: "has no value"},
+		{name: "a setting that is a list", config: `{"sqlitedb": ["a", "b"]}`, wantErr: "not a setting"},
+		{name: "a file naming another file", config: `{"config": "other.hujson"}`, wantErr: "cannot name another one"},
+		{name: "not a configuration at all", config: `nonsense`, wantErr: ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fs, _, _, _ := newFlags()
+			fs.String("config", "", "")
+			err := loadConfig(fs, writeConfig(t, tt.config))
+			if err == nil {
+				t.Fatalf("loadConfig(%s) succeeded; want an error", tt.config)
+			}
+			if tt.wantErr != "" && !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("loadConfig(%s) = %v; want it to mention %q", tt.config, err, tt.wantErr)
+			}
+		})
+	}
+
+	t.Run("a file that is not there", func(t *testing.T) {
+		fs, _, _, _ := newFlags()
+		if err := loadConfig(fs, filepath.Join(t.TempDir(), "absent.hujson")); err == nil {
+			t.Error("loadConfig of a missing file succeeded; want an error")
+		}
+	})
+}
+
+// writeConfig puts a configuration file in a temporary directory and returns
+// its path.
+func writeConfig(t *testing.T, contents string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "golink.hujson")
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestCanLockLink(t *testing.T) {

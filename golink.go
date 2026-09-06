@@ -19,13 +19,16 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	texttemplate "text/template"
@@ -33,6 +36,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/tailscale/hujson"
 	"golang.org/x/net/xsrftoken"
 	"tailscale.com/client/local"
 	"tailscale.com/client/tailscale/apitype"
@@ -77,6 +81,7 @@ var (
 	authGroupsHeader  = flag.String("auth-groups-header", "", `HTTP header holding the comma-separated groups a user belongs to (e.g. "X-Auth-Request-Groups"); only read when -auth-email-header is set`)
 	advertiseTags     = flag.String("advertise-tags", os.Getenv("TS_ADVERTISE_TAGS"), "comma-separated list of ACL tags to advertise (e.g. tag:golink)")
 	serviceName       = flag.String("register-as-service", envknob.String("TS_SERVICE_NAME"), "register as a Tailscale Service (e.g., svc:golink); requires tagged node")
+	configFile        = flag.String("config", "", "path of a file setting any of these options, one per line as \"name\": value, with comments allowed; an option given on the command line wins over the file")
 )
 
 var stats struct {
@@ -124,6 +129,12 @@ var localClient *local.Client
 
 func Run() error {
 	flag.Parse()
+
+	if *configFile != "" {
+		if err := loadConfig(flag.CommandLine, *configFile); err != nil {
+			return fmt.Errorf("reading %s: %w", *configFile, err)
+		}
+	}
 
 	if *authEmailHeader != "" {
 		// Identity comes from a proxy in front of golink, not from the tailnet.
@@ -1159,6 +1170,79 @@ func mergeQuery(u *url.URL, requestQuery url.Values) {
 }
 
 func devMode() bool { return *dev != "" }
+
+// loadConfig applies a configuration file to a set of flags. The file names
+// the same options the command line does, so that anything gettable from
+// -help is settable in the file and a new option needs nothing added here:
+//
+//	{
+//	    // Comments and trailing commas are allowed.
+//	    "open-links": true,
+//	    "sqlitedb": "/home/nonroot/golink.db",
+//	}
+//
+// An option given on the command line wins over the file, which is what makes
+// a file of settled defaults and a one-off override work together. A name the
+// flags do not know is an error rather than something to ignore, since the
+// whole point of the file is to be the place options are written down, and a
+// misspelling there would otherwise be silent.
+func loadConfig(fs *flag.FlagSet, path string) error {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	// hujson is JSON with comments and trailing commas, which a file of
+	// settings wants and which JSON refuses.
+	b, err = hujson.Standardize(b)
+	if err != nil {
+		return err
+	}
+	var settings map[string]any
+	if err := json.Unmarshal(b, &settings); err != nil {
+		return err
+	}
+
+	// Anything named on the command line stays as it was given there.
+	given := make(map[string]bool)
+	fs.Visit(func(f *flag.Flag) { given[f.Name] = true })
+
+	for _, name := range slices.Sorted(maps.Keys(settings)) {
+		if name == "config" {
+			return errors.New(`a configuration file cannot name another one ("config")`)
+		}
+		if fs.Lookup(name) == nil {
+			return fmt.Errorf("no such option %q", name)
+		}
+		if given[name] {
+			continue
+		}
+		value, err := settingValue(settings[name])
+		if err != nil {
+			return fmt.Errorf("option %q: %w", name, err)
+		}
+		if err := fs.Set(name, value); err != nil {
+			return fmt.Errorf("option %q: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// settingValue renders a value from a configuration file the way the flag
+// package would have received it on the command line.
+func settingValue(v any) (string, error) {
+	switch v := v.(type) {
+	case string:
+		return v, nil
+	case bool:
+		return strconv.FormatBool(v), nil
+	case float64:
+		return strconv.FormatFloat(v, 'f', -1, 64), nil
+	case nil:
+		return "", errors.New("has no value")
+	default:
+		return "", fmt.Errorf("is a %T, which is not a setting", v)
+	}
+}
 
 const peerCapName = "tailscale.com/cap/golink"
 
