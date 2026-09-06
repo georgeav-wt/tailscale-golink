@@ -1157,6 +1157,171 @@ func TestWithScheme(t *testing.T) {
 	}
 }
 
+func TestSlackText(t *testing.T) {
+	tests := []struct {
+		name  string
+		entry auditEntry
+		want  string
+	}{
+		{
+			name: "a link created",
+			entry: auditEntry{
+				Action: "create", Short: "aws", User: "amelie@example.com",
+				Link: &auditLink{Long: "https://aws.example.com/", Owner: "amelie@example.com"},
+			},
+			want: "*create* <http://go/.detail/aws|go/aws> by amelie@example.com\nhttps://aws.example.com/",
+		},
+		{
+			name: "a destination changed",
+			entry: auditEntry{
+				Action: "update", Short: "aws", User: "bob@example.com",
+				Link:     &auditLink{Long: "https://new.example.com/"},
+				Previous: &auditLink{Long: "https://old.example.com/"},
+			},
+			want: "*update* <http://go/.detail/aws|go/aws> by bob@example.com\nhttps://new.example.com/\n_was_ https://old.example.com/",
+		},
+		{
+			// The ampersands of a real pattern are markup to Slack.
+			name: "a pattern beside a destination",
+			entry: auditEntry{
+				Action: "create", Short: "code", User: "amelie@example.com",
+				Link: &auditLink{Long: "https://github.com/org", Pattern: "https://github.com/search?q=a&type=code"},
+			},
+			want: "*create* <http://go/.detail/code|go/code> by amelie@example.com\nhttps://github.com/org (pattern https://github.com/search?q=a&amp;type=code)",
+		},
+		{
+			name: "a link locked",
+			entry: auditEntry{
+				Action: "update", Short: "hr", User: "admin@example.com",
+				Link:     &auditLink{Long: "https://hr.example.com/", Locked: true},
+				Previous: &auditLink{Long: "https://hr.example.com/"},
+			},
+			want: "*update* <http://go/.detail/hr|go/hr> by admin@example.com\nhttps://hr.example.com/\n_locked_",
+		},
+		{
+			name: "a link deleted",
+			entry: auditEntry{
+				Action: "delete", Short: "old", User: "bob@example.com",
+				Link: &auditLink{Long: "https://gone.example.com/"},
+			},
+			want: "*delete* <http://go/.detail/old|go/old> by bob@example.com\nhttps://gone.example.com/",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := slackText(tt.entry); got != tt.want {
+				t.Errorf("slackText():\n got %q\nwant %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestWebhook tests that a change to a link reaches the webhook, in the shape
+// the format asks for, and that a webhook which fails does not affect the save
+// that caused it.
+func TestWebhook(t *testing.T) {
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	posted := make(chan string, 4)
+	status := http.StatusOK
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		posted <- string(body)
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(server.Close)
+
+	oldURL, oldFormat := *webhookURL, *webhookFormat
+	*webhookURL = server.URL
+	t.Cleanup(func() { *webhookURL, *webhookFormat = oldURL, oldFormat })
+
+	create := func(t *testing.T, short string) {
+		t.Helper()
+		form := url.Values{
+			"short": {short}, "long": {"https://example.com/" + short},
+			"xsrf": {xsrftoken.Generate(xsrfKey, "foo@example.com", newShortName)},
+		}
+		r := httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		serveSave(w, r)
+		if w.Code != http.StatusOK {
+			t.Fatalf("serveSave = %d (%s); want 200", w.Code, w.Body.String())
+		}
+	}
+	receive := func(t *testing.T) string {
+		t.Helper()
+		select {
+		case body := <-posted:
+			return body
+		case <-time.After(5 * time.Second):
+			t.Fatal("nothing reached the webhook")
+			return ""
+		}
+	}
+
+	t.Run("slack", func(t *testing.T) {
+		*webhookFormat = "slack"
+		startWebhook()
+		t.Cleanup(stopWebhook)
+
+		create(t, "one")
+		var body struct{ Text string }
+		if err := json.Unmarshal([]byte(receive(t)), &body); err != nil {
+			t.Fatalf("the webhook body is not what Slack expects: %v", err)
+		}
+		for _, want := range []string{"*create*", "go/one", "foo@example.com", "https://example.com/one"} {
+			if !strings.Contains(body.Text, want) {
+				t.Errorf("the message %q does not mention %q", body.Text, want)
+			}
+		}
+	})
+
+	t.Run("json", func(t *testing.T) {
+		*webhookFormat = "json"
+		startWebhook()
+		t.Cleanup(stopWebhook)
+
+		create(t, "two")
+		var entry auditEntry
+		if err := json.Unmarshal([]byte(receive(t)), &entry); err != nil {
+			t.Fatalf("the webhook body is not an audit event: %v", err)
+		}
+		if entry.Action != "create" || entry.Short != "two" || entry.User != "foo@example.com" {
+			t.Errorf("the event posted was %+v", entry)
+		}
+	})
+
+	t.Run("a webhook that refuses does not fail the save", func(t *testing.T) {
+		*webhookFormat = "slack"
+		status = http.StatusInternalServerError
+		t.Cleanup(func() { status = http.StatusOK })
+		startWebhook()
+		t.Cleanup(stopWebhook)
+
+		create(t, "three") // fails the test itself if the save does not return 200
+		receive(t)
+		if _, err := db.Load("three"); err != nil {
+			t.Errorf("the link was not saved though only the webhook failed: %v", err)
+		}
+	})
+
+	t.Run("no webhook configured", func(t *testing.T) {
+		stopWebhook() // webhookEvents is nil, as it is when -webhook-url is unset
+		create(t, "four")
+		select {
+		case body := <-posted:
+			t.Errorf("something was posted with no webhook running: %s", body)
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
+}
+
 func TestLoadConfig(t *testing.T) {
 	// A set of flags of the shapes a real configuration would set, kept apart
 	// from the process's own so that this cannot disturb another test.

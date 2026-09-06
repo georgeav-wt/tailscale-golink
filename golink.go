@@ -82,6 +82,8 @@ var (
 	advertiseTags     = flag.String("advertise-tags", os.Getenv("TS_ADVERTISE_TAGS"), "comma-separated list of ACL tags to advertise (e.g. tag:golink)")
 	serviceName       = flag.String("register-as-service", envknob.String("TS_SERVICE_NAME"), "register as a Tailscale Service (e.g., svc:golink); requires tagged node")
 	configFile        = flag.String("config", "", "path of a file setting any of these options, one per line as \"name\": value, with comments allowed; an option given on the command line wins over the file")
+	webhookURL        = flag.String("webhook-url", "", "if non-empty, POST every audit event to this URL; it is a credential, so prefer -config to the command line, where it would be visible in the process list")
+	webhookFormat     = flag.String("webhook-format", "slack", `shape of the webhook body: "slack" for a message an incoming webhook renders, or "json" for the audit event itself`)
 )
 
 var stats struct {
@@ -134,6 +136,15 @@ func Run() error {
 		if err := loadConfig(flag.CommandLine, *configFile); err != nil {
 			return fmt.Errorf("reading %s: %w", *configFile, err)
 		}
+	}
+
+	switch *webhookFormat {
+	case "slack", "json":
+	default:
+		return fmt.Errorf("-webhook-format %q is not one of slack or json", *webhookFormat)
+	}
+	if *webhookURL != "" {
+		startWebhook()
 	}
 
 	if *authEmailHeader != "" {
@@ -472,13 +483,7 @@ func init() {
 var tmplFuncs = template.FuncMap{
 	// go is a template function that returns the hostname of the golink service.
 	// This is used throughout the UI to render links, but does not impact link resolution.
-	"go": func() string {
-		if devMode() {
-			// in dev mode, just use "go" instead of "localhost:8080"
-			return defaultHostname
-		}
-		return *hostname
-	},
+	"go": func() string { return linkHostname() },
 }
 
 // newTemplate creates a new template with the specified files in the tmpl directory.
@@ -1171,6 +1176,16 @@ func mergeQuery(u *url.URL, requestQuery url.Values) {
 
 func devMode() bool { return *dev != "" }
 
+// linkHostname is the host that go links are written with, in the UI and
+// anywhere else golink names one.
+func linkHostname() string {
+	if devMode() {
+		// in dev mode, just use "go" instead of "localhost:8080"
+		return defaultHostname
+	}
+	return *hostname
+}
+
 // loadConfig applies a configuration file to a set of flags. The file names
 // the same options the command line does, so that anything gettable from
 // -help is settable in the file and a new option needs nothing added here:
@@ -1802,10 +1817,152 @@ func logAudit(action string, u user, link, previous *Link) {
 	}
 
 	auditMu.Lock()
-	defer auditMu.Unlock()
 	if err := json.NewEncoder(auditWriter).Encode(entry); err != nil {
 		log.Printf("writing audit log: %v", err)
 	}
+	auditMu.Unlock()
+
+	notifyWebhook(entry)
+}
+
+// webhookEvents carries audit events to the goroutine that posts them. Saving
+// a link never waits on somebody else's HTTP server, and never fails because
+// of it: an audit trail that can break the thing it audits is worse than one
+// with a hole in it, and a hole is logged when it happens.
+var webhookEvents chan auditEntry
+
+// webhookDone is closed once the sender has finished the events it was given.
+var webhookDone chan struct{}
+
+// webhookQueueLength is how far the sender may fall behind before events are
+// dropped. Links are edited by hand, so this is minutes of the busiest
+// imaginable day.
+const webhookQueueLength = 64
+
+// startWebhook begins posting audit events to -webhook-url.
+func startWebhook() {
+	webhookEvents = make(chan auditEntry, webhookQueueLength)
+	webhookDone = make(chan struct{})
+
+	go func() {
+		defer close(webhookDone)
+		client := &http.Client{Timeout: 10 * time.Second}
+		for entry := range webhookEvents {
+			if err := postWebhook(client, entry); err != nil {
+				log.Printf("posting %s of %s to the webhook: %v", entry.Action, entry.Short, err)
+			}
+		}
+	}()
+}
+
+// stopWebhook finishes the events already queued and stops the sender. Nothing
+// but a test needs it; the process otherwise runs until it is killed.
+func stopWebhook() {
+	if webhookEvents == nil {
+		return
+	}
+	close(webhookEvents)
+	<-webhookDone
+	webhookEvents = nil
+}
+
+// notifyWebhook hands an audit event to the sender, or drops it if the sender
+// is far enough behind that keeping it would mean growing without bound.
+func notifyWebhook(entry auditEntry) {
+	if webhookEvents == nil {
+		return
+	}
+	select {
+	case webhookEvents <- entry:
+	default:
+		log.Printf("dropping %s of %s: the webhook is not keeping up", entry.Action, entry.Short)
+	}
+}
+
+// postWebhook sends one audit event.
+//
+// No error it returns names the URL. A Slack webhook URL is a credential, and
+// the errors of net/http carry the URL they were given, so they are unwrapped
+// before they can be logged.
+func postWebhook(client *http.Client, entry auditEntry) error {
+	body, err := webhookBody(entry)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", *webhookURL, bytes.NewReader(body))
+	if err != nil {
+		return errors.New("the webhook URL cannot be requested")
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) && urlErr.Err != nil {
+			return urlErr.Err
+		}
+		return errors.New("the request failed")
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode/100 != 2 {
+		// Slack answers a refusal with a short reason, such as no_service.
+		reply, _ := io.ReadAll(io.LimitReader(resp.Body, 256))
+		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(reply)))
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	return nil
+}
+
+// webhookBody renders an audit event in the shape -webhook-format asks for.
+func webhookBody(entry auditEntry) ([]byte, error) {
+	if *webhookFormat == "json" {
+		return json.Marshal(entry)
+	}
+	return json.Marshal(map[string]string{"text": slackText(entry)})
+}
+
+// slackText renders an audit event as one line of Slack markup: what happened,
+// to which link, by whom, and where the link points now.
+func slackText(entry auditEntry) string {
+	var b strings.Builder
+	name := entry.Short
+	fmt.Fprintf(&b, "*%s* <http://%s/.detail/%s|%s/%s> by %s",
+		entry.Action, linkHostname(), name, linkHostname(), slackEscape(name), slackEscape(entry.User))
+
+	if to := auditLinkText(entry.Link); to != "" {
+		fmt.Fprintf(&b, "\n%s", to)
+	}
+	if from := auditLinkText(entry.Previous); from != "" && from != auditLinkText(entry.Link) {
+		fmt.Fprintf(&b, "\n_was_ %s", from)
+	}
+	if entry.Link != nil && entry.Previous != nil && entry.Link.Locked != entry.Previous.Locked {
+		if entry.Link.Locked {
+			b.WriteString("\n_locked_")
+		} else {
+			b.WriteString("\n_unlocked_")
+		}
+	}
+	return b.String()
+}
+
+// auditLinkText describes where a link pointed, in the two fields it has.
+func auditLinkText(l *auditLink) string {
+	switch {
+	case l == nil:
+		return ""
+	case l.Long != "" && l.Pattern != "":
+		return slackEscape(l.Long) + " (pattern " + slackEscape(l.Pattern) + ")"
+	case l.Pattern != "":
+		return "pattern " + slackEscape(l.Pattern)
+	}
+	return slackEscape(l.Long)
+}
+
+// slackEscape escapes the three characters Slack reads as markup. A
+// destination is full of ampersands.
+func slackEscape(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
 }
 
 // serveExport prints a snapshot of the link database. Links are JSON encoded

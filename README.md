@@ -312,6 +312,21 @@ and a one-off override work together. An option name the file gets wrong is an e
 startup rather than something quietly ignored. `deploy/golink.hujson` is a worked
 example.
 
+## Audit webhook
+
+`-webhook-url` posts every create, update and delete of a link. With
+`-webhook-format slack`, the default, the body is a message a
+[Slack incoming webhook](https://api.slack.com/messaging/webhooks) renders; with
+`json` it is the audit event itself, the same object the log line carries.
+
+The URL is a credential, so prefer to give it in a configuration file rather than on
+the command line, where the process list would show it. Nothing golink logs about a
+webhook failure names the URL.
+
+Posting happens on its own goroutine: saving a link never waits on the webhook and
+never fails because the webhook did. If the webhook cannot keep up, events are dropped
+with a line in the log rather than queued without bound.
+
 ## Permissions
 
 By default, users own the links they create and only they can update or delete those links.
