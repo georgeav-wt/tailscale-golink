@@ -1322,6 +1322,88 @@ func TestWebhook(t *testing.T) {
 	})
 }
 
+// TestAdminOnlyExport tests that -admin-only-export holds back the export of
+// every link, and stops the pages offering the URLs that read the whole link
+// set, while leaving the stats and metrics endpoints answering anybody.
+func TestAdminOnlyExport(t *testing.T) {
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Save(&Link{Short: "aws", Long: "https://aws.example.com/", Owner: "foo@example.com"})
+
+	get := func(t *testing.T, path string, u user) *httptest.ResponseRecorder {
+		t.Helper()
+		oldCurrentUser := currentUser
+		currentUser = func(*http.Request) (user, error) { return u, nil }
+		t.Cleanup(func() { currentUser = oldCurrentUser })
+
+		r := httptest.NewRequest("GET", path, nil)
+		w := httptest.NewRecorder()
+		serveHandler().ServeHTTP(w, r)
+		return w
+	}
+
+	var (
+		anybody = user{login: "bar@example.com"}
+		admin   = user{login: "amelie@example.com", isAdmin: true}
+	)
+
+	t.Run("without the option everybody may export", func(t *testing.T) {
+		oldFlag := *adminOnlyExport
+		*adminOnlyExport = false
+		t.Cleanup(func() { *adminOnlyExport = oldFlag })
+
+		if got := get(t, "/.export", anybody).Code; got != http.StatusOK {
+			t.Errorf("GET /.export = %d; want 200", got)
+		}
+		if body := get(t, "/.all", anybody).Body.String(); !strings.Contains(body, "/.export") {
+			t.Error("/.all does not offer the export, though anybody may use it")
+		}
+	})
+
+	t.Run("with the option only an admin may", func(t *testing.T) {
+		oldFlag := *adminOnlyExport
+		*adminOnlyExport = true
+		t.Cleanup(func() { *adminOnlyExport = oldFlag })
+
+		if got := get(t, "/.export", anybody).Code; got != http.StatusForbidden {
+			t.Errorf("GET /.export as anybody = %d; want 403", got)
+		}
+		if w := get(t, "/.export", admin); w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"Short":"aws"`) {
+			t.Errorf("GET /.export as an admin = %d (%s); want the links", w.Code, w.Body.String())
+		}
+
+		// Stats and metrics answer anybody either way: Prometheus scrapes
+		// them, and it holds no session.
+		for _, path := range []string{"/.export-stats", "/.metrics"} {
+			if got := get(t, path, anybody).Code; got != http.StatusOK {
+				t.Errorf("GET %s as anybody = %d; want 200", path, got)
+			}
+		}
+	})
+
+	t.Run("with the option the pages stop offering the URLs", func(t *testing.T) {
+		oldFlag := *adminOnlyExport
+		*adminOnlyExport = true
+		t.Cleanup(func() { *adminOnlyExport = oldFlag })
+
+		for _, path := range []string{"/.all", "/.help"} {
+			if body := get(t, path, anybody).Body.String(); strings.Contains(body, "/.export") {
+				t.Errorf("%s still offers the export to somebody who cannot use it", path)
+			}
+			if body := get(t, path, admin).Body.String(); !strings.Contains(body, "/.export") {
+				t.Errorf("%s does not offer the export to an admin", path)
+			}
+		}
+		// The help page keeps describing everything else.
+		if body := get(t, "/.help", anybody).Body.String(); !strings.Contains(body, "/.all") {
+			t.Error("/.help stopped describing the pages anybody can use")
+		}
+	})
+}
+
 func TestLoadConfig(t *testing.T) {
 	// A set of flags of the shapes a real configuration would set, kept apart
 	// from the process's own so that this cannot disturb another test.

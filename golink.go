@@ -77,6 +77,7 @@ var (
 	readonly          = flag.Bool("readonly", false, "start golink server in read-only mode")
 	openLinks         = flag.Bool("open-links", false, "allow any user to edit any link that its owner has not locked")
 	ownerCanLock      = flag.Bool("owner-can-lock", false, "let the owner of a link lock it, as well as an admin; only meaningful with -open-links")
+	adminOnlyExport   = flag.Bool("admin-only-export", false, "let only admins export every link at once, and stop offering the export, stats and metrics URLs to anybody else")
 	authEmailHeader   = flag.String("auth-email-header", "", `if non-empty, identify users by this HTTP header, set by an authenticating proxy in front of golink (e.g. "X-Auth-Request-Email"), rather than by their tailnet identity`)
 	authGroupsHeader  = flag.String("auth-groups-header", "", `HTTP header holding the comma-separated groups a user belongs to (e.g. "X-Auth-Request-Groups"); only read when -auth-email-header is set`)
 	advertiseTags     = flag.String("advertise-tags", os.Getenv("TS_ADVERTISE_TAGS"), "comma-separated list of ACL tags to advertise (e.g. tag:golink)")
@@ -383,6 +384,9 @@ type searchData struct {
 	// Sort is the order the results are in, one of the sortOrders keys.
 	Sort    string
 	Results []searchResult
+
+	// ShowBulkURLs is whether to offer the link that exports every link.
+	ShowBulkURLs bool
 }
 
 // SortLink returns the URL of these same results in another order, for the
@@ -706,12 +710,33 @@ func serveAll(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cu, _ := requestUser(r)
 	order := sortOrder(r.URL.Query().Get("sort"))
-	searchTmpl.Execute(w, searchData{Sort: order, Results: searchResults(links, order)})
+	searchTmpl.Execute(w, searchData{
+		Sort:         order,
+		Results:      searchResults(links, order),
+		ShowBulkURLs: showBulkURLs(cu),
+	})
 }
 
-func serveHelp(w http.ResponseWriter, _ *http.Request) {
-	helpTmpl.Execute(w, nil)
+// helpData is the data used by the helpTmpl template.
+type helpData struct {
+	// ShowBulkURLs is whether to describe the URLs that read the whole link
+	// set at once. They keep working for anyone when -admin-only-export is not
+	// set; this only decides whether they are offered.
+	ShowBulkURLs bool
+}
+
+func serveHelp(w http.ResponseWriter, r *http.Request) {
+	// A failure to say who this is means they are not an admin, which is the
+	// safe way round and leaves the rest of the page readable.
+	cu, _ := requestUser(r)
+	helpTmpl.Execute(w, helpData{ShowBulkURLs: showBulkURLs(cu)})
+}
+
+// showBulkURLs reports whether to offer the URLs that read every link at once.
+func showBulkURLs(u user) bool {
+	return !*adminOnlyExport || u.isAdmin
 }
 
 func serveOpenSearch(w http.ResponseWriter, _ *http.Request) {
@@ -1014,8 +1039,14 @@ func serveSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cu, _ := requestUser(r)
 	order := sortOrder(r.URL.Query().Get("sort"))
-	searchTmpl.Execute(w, searchData{Query: query, Sort: order, Results: searchResults(links, order)})
+	searchTmpl.Execute(w, searchData{
+		Query:        query,
+		Sort:         order,
+		Results:      searchResults(links, order),
+		ShowBulkURLs: showBulkURLs(cu),
+	})
 }
 
 type expandEnv struct {
@@ -1968,7 +1999,21 @@ func slackEscape(s string) string {
 // serveExport prints a snapshot of the link database. Links are JSON encoded
 // and printed one per line. This format is used to restore link snapshots on
 // startup.
-func serveExport(w http.ResponseWriter, _ *http.Request) {
+func serveExport(w http.ResponseWriter, r *http.Request) {
+	if *adminOnlyExport {
+		// Every link in one request is a different thing from looking one up,
+		// so it can be held to a different rule.
+		cu, err := requestUser(r)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !cu.isAdmin {
+			http.Error(w, "only an admin can export every link", http.StatusForbidden)
+			return
+		}
+	}
+
 	if err := flushStats(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

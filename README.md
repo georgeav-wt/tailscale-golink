@@ -312,6 +312,17 @@ and a one-off override work together. An option name the file gets wrong is an e
 startup rather than something quietly ignored. `deploy/golink.hujson` is a worked
 example.
 
+## Restricting the export
+
+`-admin-only-export` lets only an admin fetch `/.export`, which is every link in one
+request. The pages stop offering that URL, and the stats and metrics URLs, to anyone
+who is not an admin.
+
+`/.export-stats` and `/.metrics` keep answering everybody either way: a metrics scraper
+holds no session, so refusing it would break the scrape rather than protect anything.
+Not listing them on the help page is about not advertising a diagnostic, and is no
+substitute for keeping them behind whatever authenticates the rest of the service.
+
 ## Audit webhook
 
 `-webhook-url` posts every create, update and delete of a link. With
