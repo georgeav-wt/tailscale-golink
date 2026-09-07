@@ -11,8 +11,14 @@
 # authorised redirect URIs. Google allows http only for localhost, so a
 # different host here needs https and a matching GOLINK_REDIRECT_URL.
 #
-# It shares the golink-data volume with start-dev.sh, so the links are the same
-# ones; the difference is who nginx says you are.
+# It shares the database with start-dev.sh, so the links are the same ones; the
+# difference is who nginx says you are.
+#
+# Two secrets matter once more than one instance serves the same links, and both
+# are generated here when unset, which is right for one machine and wrong for a
+# Deployment: GOLINK_COOKIE_SECRET, which oauth2-proxy encrypts its session
+# with, and GOLINK_XSRF_KEY, which golink signs its forms with. Give both from a
+# Secret in the cluster, the same value to every pod.
 set -eu
 
 missing=
@@ -33,6 +39,15 @@ if [ -z "${GOLINK_COOKIE_SECRET:-}" ]; then
     GOLINK_COOKIE_SECRET=$(openssl rand -base64 32 | tr -- '+/' '-_')
     export GOLINK_COOKIE_SECRET
     echo "generated a cookie secret for this run; set GOLINK_COOKIE_SECRET to keep sessions across restarts"
+fi
+
+# golink signs the XSRF tokens in its forms with this. One instance can invent
+# its own; two cannot, because a form rendered by one would be refused by the
+# other, so the deployment keeps a fixed one in a Secret.
+if [ -z "${GOLINK_XSRF_KEY:-}" ]; then
+    GOLINK_XSRF_KEY=$(openssl rand -base64 32 | tr -- '+/' '-_')
+    export GOLINK_XSRF_KEY
+    echo "generated an XSRF key for this run; set GOLINK_XSRF_KEY to share one between instances"
 fi
 
 port=${1:-${GOLINK_PORT:-8080}}

@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -31,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	texttemplate "text/template"
 	"time"
 
@@ -78,6 +80,7 @@ var (
 	openLinks         = flag.Bool("open-links", false, "allow any user to edit any link that its owner has not locked")
 	ownerCanLock      = flag.Bool("owner-can-lock", false, "let the owner of a link lock it, as well as an admin; only meaningful with -open-links")
 	adminOnlyExport   = flag.Bool("admin-only-export", false, "let only admins export every link at once, and stop offering the export, stats and metrics URLs to anybody else")
+	xsrfKeyFlag       = flag.String("xsrf-key", os.Getenv("GOLINK_XSRF_KEY"), "secret the XSRF tokens in forms are signed with, shared by every instance serving the same links; without it each instance invents its own and refuses the forms of the others. It is a credential, so give it in the environment or -config rather than on the command line")
 	authEmailHeader   = flag.String("auth-email-header", "", `if non-empty, identify users by this HTTP header, set by an authenticating proxy in front of golink (e.g. "X-Auth-Request-Email"), rather than by their tailnet identity`)
 	authGroupsHeader  = flag.String("auth-groups-header", "", `HTTP header holding the comma-separated groups a user belongs to (e.g. "X-Auth-Request-Groups"); only read when -auth-email-header is set`)
 	advertiseTags     = flag.String("advertise-tags", os.Getenv("TS_ADVERTISE_TAGS"), "comma-separated list of ACL tags to advertise (e.g. tag:golink)")
@@ -137,6 +140,13 @@ func Run() error {
 		if err := loadConfig(flag.CommandLine, *configFile); err != nil {
 			return fmt.Errorf("reading %s: %w", *configFile, err)
 		}
+	}
+
+	if *xsrfKeyFlag != "" {
+		if len(*xsrfKeyFlag) < minXSRFKeyLength {
+			return fmt.Errorf("-xsrf-key is %d characters; it needs at least %d", len(*xsrfKeyFlag), minXSRFKeyLength)
+		}
+		xsrfKey = *xsrfKeyFlag
 	}
 
 	switch *webhookFormat {
@@ -220,6 +230,7 @@ func Run() error {
 
 	// flush stats periodically
 	go flushStatsLoop()
+	flushStatsOnShutdown()
 
 	if *dev != "" {
 		// override default hostname for dev mode
@@ -466,7 +477,16 @@ type deleteData struct {
 	XSRF    string
 }
 
+// xsrfKey signs the tokens that say a form came from this service rather than
+// from somewhere else. It is generated per process, which is right for one
+// process and wrong for several: a form rendered by one instance would be
+// refused by any other. -xsrf-key replaces it with a shared secret.
 var xsrfKey string
+
+// minXSRFKeyLength is the shortest shared key worth accepting. The generated
+// one is 24 random bytes; a short one weakens every token signed with it, so a
+// mistyped or truncated secret is refused rather than quietly used.
+const minXSRFKeyLength = 16
 
 func init() {
 	homeTmpl = newTemplate("base.html", "home.html")
@@ -547,14 +567,26 @@ func flushStats() error {
 	stats.mu.Lock()
 	defer stats.mu.Unlock()
 
-	if len(stats.dirty) == 0 {
-		return nil
+	if len(stats.dirty) > 0 {
+		if err := db.SaveStats(stats.dirty); err != nil {
+			return err
+		}
+		stats.dirty = make(ClickStats)
 	}
 
-	if err := db.SaveStats(stats.dirty); err != nil {
+	// Read the totals back -- always, not only after a save -- so that an
+	// instance counts the clicks the others have recorded as well as its own.
+	// Without this each one would show only what it had seen since it started,
+	// and two instances would disagree about which links are popular; an
+	// instance that happens to be receiving no traffic would never catch up at
+	// all. The stored rows are increments, so the sum is right however many
+	// instances there are, and a link deleted elsewhere drops out of this list
+	// too, because deleting one deletes its rows.
+	clicks, err := db.LoadStats()
+	if err != nil {
 		return err
 	}
-	stats.dirty = make(ClickStats)
+	stats.clicks = clicks
 	return nil
 }
 
@@ -566,6 +598,24 @@ func flushStatsLoop() {
 		}
 		time.Sleep(time.Minute)
 	}
+}
+
+// flushStatsOnShutdown writes the clicks counted since the last flush when the
+// process is asked to stop, so that a rolling restart does not throw away a
+// minute of them for every instance it replaces.
+func flushStatsOnShutdown() {
+	stopping := make(chan os.Signal, 1)
+	signal.Notify(stopping, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-stopping
+		if err := flushStats(); err != nil {
+			log.Printf("flushing stats before stopping: %v", err)
+		}
+		// Having done the one thing worth doing, stop the way an unhandled
+		// signal would have.
+		signal.Reset(sig.(syscall.Signal))
+		syscall.Kill(syscall.Getpid(), sig.(syscall.Signal))
+	}()
 }
 
 // deleteLinkStats removes the link stats from memory.

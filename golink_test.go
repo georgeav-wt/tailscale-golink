@@ -1404,6 +1404,110 @@ func TestAdminOnlyExport(t *testing.T) {
 	})
 }
 
+// TestSharedXSRFKey tests the property more than one instance depends on: a
+// form rendered by one is accepted by another when they share -xsrf-key, and
+// refused when they do not.
+func TestSharedXSRFKey(t *testing.T) {
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Owned by the user the tests act as, so that nothing but the token
+	// decides the outcome.
+	db.Save(&Link{Short: "lk", Long: "http://before/", Owner: "foo@example.com"})
+
+	// Two instances, standing in for two pods behind the same address.
+	const (
+		keyOfOne = "a-secret-both-instances-share"
+		keyOfTwo = "a-different-secret-entirely"
+	)
+
+	// A token is minted by one instance and posted to another, which is what
+	// happens when a form is rendered by one pod and submitted to the next.
+	post := func(t *testing.T, mintedWith, servedWith string) int {
+		t.Helper()
+		oldKey := xsrfKey
+		t.Cleanup(func() { xsrfKey = oldKey })
+
+		xsrfKey = mintedWith
+		token := xsrftoken.Generate(xsrfKey, "foo@example.com", "lk")
+
+		xsrfKey = servedWith
+		form := url.Values{"short": {"lk"}, "long": {"http://after/"}, "owner": {"foo@example.com"}, "xsrf": {token}}
+		r := httptest.NewRequest("POST", "/", strings.NewReader(form.Encode()))
+		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		w := httptest.NewRecorder()
+		serveSave(w, r)
+		return w.Code
+	}
+
+	if got := post(t, keyOfOne, keyOfOne); got != http.StatusOK {
+		t.Errorf("a form minted and served with the same key = %d; want 200", got)
+	}
+	if got := post(t, keyOfOne, keyOfTwo); got != http.StatusBadRequest {
+		t.Errorf("a form minted with one key and served with another = %d; want 400", got)
+	}
+}
+
+// TestFlushStatsReloadsTotals tests that an instance picks up the clicks other
+// instances have recorded, rather than counting only its own.
+func TestFlushStatsReloadsTotals(t *testing.T) {
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Save(&Link{Short: "lk", Long: "http://lk/"})
+
+	// What another instance has already written.
+	if err := db.SaveStats(ClickStats{"lk": 7}); err != nil {
+		t.Fatal(err)
+	}
+
+	// What this one has counted since it started.
+	stats.mu.Lock()
+	stats.clicks = ClickStats{"lk": 2}
+	stats.dirty = ClickStats{"lk": 2}
+	stats.mu.Unlock()
+	t.Cleanup(func() {
+		stats.mu.Lock()
+		stats.clicks, stats.dirty = nil, nil
+		stats.mu.Unlock()
+	})
+
+	if err := flushStats(); err != nil {
+		t.Fatal(err)
+	}
+
+	stats.mu.Lock()
+	got := stats.clicks["lk"]
+	dirty := len(stats.dirty)
+	stats.mu.Unlock()
+
+	if got != 9 {
+		t.Errorf("clicks after flushing = %d; want 9, this instance's 2 and another's 7", got)
+	}
+	if dirty != 0 {
+		t.Errorf("%d clicks still unwritten after a flush; want 0", dirty)
+	}
+
+	// An instance with nothing of its own to write still catches up, which is
+	// the case that matters for a pod receiving no traffic of its own.
+	if err := db.SaveStats(ClickStats{"lk": 3}); err != nil {
+		t.Fatal(err)
+	}
+	if err := flushStats(); err != nil {
+		t.Fatal(err)
+	}
+	stats.mu.Lock()
+	got = stats.clicks["lk"]
+	stats.mu.Unlock()
+	if got != 12 {
+		t.Errorf("clicks after an idle flush = %d; want 12", got)
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	// A set of flags of the shapes a real configuration would set, kept apart
 	// from the process's own so that this cannot disturb another test.

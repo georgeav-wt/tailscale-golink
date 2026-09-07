@@ -129,7 +129,7 @@ the diff a strict addition rather than a change of semantics, which is the only
 version of this that has any chance upstream. **We run with `-open-links`.**
 
 - `schema.sql`: `Locked INTEGER NOT NULL DEFAULT 0`. There is deliberately **no
-  migration code**; see the note under step 14 for what that means the day a column is
+  migration code**; see the note under step 15 for what that means the day a column is
   added after deploying.
 - `db.go`: `Locked bool` on `Link`, tagged `json:",omitempty"` so `/.export` snapshots
   of unlocked links stay byte-identical to upstream's.
@@ -594,7 +594,52 @@ not `$host`, which drops the port that golink builds its own URLs from. And **no
 `skip_auth_regex`** for `/.` paths: `/.export` hands out every link in one request and
 `/.metrics` names every link in its labels. Point Prometheus at the pod.
 
-### 14. Deployment shape
+### 14. More than one instance (**done**, commit `golink: let more than one instance serve the same links`)
+
+Three pieces of per-process state made a second replica misbehave in ways that a
+health check would not have caught. All three are now shared or converged, so the
+remaining obstacle to 2+ pods is the database, which is what step 15's MySQL work is
+about; **two processes cannot share one SQLite file** — the second one fails at startup
+with `database is locked (5)`, verified.
+
+**The XSRF key.** `xsrfKey` was 32 random bytes drawn in `init()`, so each process
+signed its forms with a different key and refused every form rendered by another: with
+two pods behind a round-robin Service, roughly half of all saves would fail with
+`invalid XSRF token`, and a retry would sometimes work, which is the worst way for a bug
+to present. `-xsrf-key` (default `$GOLINK_XSRF_KEY`) sets it, and a key under 16
+characters is refused at startup rather than accepted as a weak one. Unset, the
+random per-process key remains, so a single instance needs no configuration.
+
+- It is a **credential**: give it in the environment or `-config`, not on the command
+  line where the process list would show it. Same reasoning as `-webhook-url` in step 11.
+- Verified live with two processes: a form rendered by A and submitted to B returns
+  **200** with a shared key and **400 invalid XSRF token** without one.
+- `TestSharedXSRFKey` mints a token with one key and serves the request with another.
+  The fixture owner is `foo@example.com`, the dev-mode user, so the token is the only
+  thing that can decide the outcome.
+
+**The click counter.** `stats.clicks` is an in-memory total flushed to the `Stats`
+ledger every 5 seconds. Two instances each held their own total, so whichever flushed
+last overwrote the other's — `INSERT OR REPLACE` on `(ID, Created)`, one row per minute.
+`flushStats` now reads the totals back after saving, so each instance picks up what the
+others recorded and the two converge within a flush. `TestFlushStatsReloadsTotals`
+covers it.
+
+**Shutdown.** Up to 5 seconds of clicks lived only in memory, and a rolling deploy kills
+pods regularly. A SIGINT/SIGTERM handler flushes once and then re-raises the signal, so
+the process still dies the way its supervisor expects and the exit status still says
+"killed by signal". It is best-effort: a `SIGKILL` after the grace period, or a crash,
+still loses whatever was not flushed. Clicks are a popularity heuristic, so that is
+an acceptable trade; anything requiring exact counts would have to write through.
+
+**Also shared, and already handled**: oauth2-proxy's session cookie. Its store is
+stateless — the session is in the cookie — so no sticky sessions and no Redis are
+needed, **provided every pod is given the same `--cookie-secret`**. A generated one, as
+`start-prod.sh` does when the variable is unset, is single-instance only, and the script
+says so on the way past. If Admin SDK group membership makes the cookie large, raise nginx's
+`proxy_buffer_size`.
+
+### 15. Deployment shape
 
 nginx → oauth2-proxy (Google) → golink:
 
@@ -605,6 +650,10 @@ nginx → oauth2-proxy (Google) → golink:
 
 Add `-owner-can-lock` if locking should not be an admin-only decision, and
 `-admin-only-export` to hold the whole-link-set export to admins.
+
+For more than one replica, two Secret values must be **the same in every pod** — golink's
+`GOLINK_XSRF_KEY` and oauth2-proxy's `--cookie-secret`. See step 14; note that SQLite
+on a PVC cannot back more than one pod at all.
 
 Forgetting `-open-links` silently gives you upstream's owner-locked model.
 Forgetting `-auth-email-header` silently makes **everyone** `foo@example.com`,

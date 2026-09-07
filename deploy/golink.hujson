@@ -25,6 +25,13 @@
     "auth-email-header": "X-Auth-Request-Email",
     "auth-groups-header": "X-Auth-Request-Groups",
 
+    // Signs the XSRF tokens in forms. Every instance serving the same links
+    // must use the same value, or a form rendered by one is refused by the
+    // next; without it each instance invents its own, which is right only when
+    // there is one. Also settable as GOLINK_XSRF_KEY, which suits a Secret
+    // better than a file does.
+    // "xsrf-key": "at least sixteen characters of random",
+
     // Where to post an audit event. This URL is a credential -- anyone holding
     // it can post to the channel -- so keep this file readable only by the
     // user golink runs as, and prefer it to the command line, where the URL

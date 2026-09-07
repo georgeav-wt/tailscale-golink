@@ -16,6 +16,13 @@ services:
       - -open-links
       - -auth-email-header=X-Auth-Request-Email
       - -auth-groups-header=X-Auth-Request-Groups
+    environment:
+      # The key golink signs its forms with, read by -xsrf-key's default. In the
+      # environment rather than in the command above, because a credential on a
+      # command line shows up in the process list. Unset, each instance invents
+      # its own, which is right only when there is one of them; start-prod.sh
+      # generates one so that this stack behaves like the deployment.
+      - GOLINK_XSRF_KEY
     volumes:
       # A directory in the working tree, not a named volume: a named one was
       # removed once by a compose invocation that was only meant to swap

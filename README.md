@@ -418,6 +418,36 @@ is an admin in addition to anyone granted admin by an ACL grant; an empty table
 grants nothing. Note that the table is not part of a `/.export` snapshot, so
 back it up separately.
 
+## Running more than one instance
+
+Several golink processes can serve the same links, provided two things are shared.
+
+**The XSRF key.** golink signs the hidden token in its forms, and by default it
+invents a key when it starts, so a form rendered by one instance is refused by
+another with `invalid XSRF token`. Give every instance the same `-xsrf-key`, at
+least 16 characters, and they accept each other's forms:
+
+    GOLINK_XSRF_KEY=... golink ...          # or "xsrf-key" in the config file
+
+It is a credential, so prefer the environment or the configuration file to the
+command line, where the process list would show it. A key shorter than 16
+characters is refused at startup rather than accepted as a weak one.
+
+**The session, if something authenticates in front.** oauth2-proxy keeps its session
+in the cookie rather than on the server, so no sticky sessions or shared cache are
+needed -- but every instance of it must be given the same `--cookie-secret`, or a
+session minted by one is not readable by the next.
+
+Two other things follow from more than one instance:
+
+ - **The database has to be one they can share.** Two processes cannot use one SQLite
+   file: the second to start fails with `database is locked`.
+ - **Click counts converge rather than being exact.** Each instance counts clicks in
+   memory and writes what it has counted every five seconds, then reads the totals
+   back, so a link's count includes every instance's clicks within a flush. A
+   `SIGINT` or `SIGTERM` flushes once before exiting, so a rolling restart does not
+   throw away the last few seconds; a `SIGKILL` does.
+
 ## Backups
 
 Once you have golink running, you can back up all of your links in [JSON lines] format from <http://go/.export>.
