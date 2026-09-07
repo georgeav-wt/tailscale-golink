@@ -7,6 +7,10 @@
 #
 #   GOLINK_OAUTH_CLIENT_ID=... GOLINK_OAUTH_CLIENT_SECRET=... ./start-prod.sh
 #
+# Add --mysql to keep the links in a MySQL container instead of the SQLite file,
+# which is the arrangement the cluster uses. The two hold different links; see
+# compose.mysql.yaml.
+#
 # The Google OAuth client needs http://localhost:8080/oauth2/callback among its
 # authorised redirect URIs. Google allows http only for localhost, so a
 # different host here needs https and a matching GOLINK_REDIRECT_URL.
@@ -20,6 +24,17 @@
 # with, and GOLINK_XSRF_KEY, which golink signs its forms with. Give both from a
 # Secret in the cluster, the same value to every pod.
 set -eu
+
+compose_files="-f compose.prod.yaml"
+backend=SQLite
+while [ $# -gt 0 ]; do
+    case $1 in
+        --mysql)  compose_files="-f compose.prod.yaml -f compose.mysql.yaml"; backend=MySQL; shift ;;
+        --sqlite) shift ;;
+        --*)      echo "unknown option: $1" >&2; exit 2 ;;
+        *)        break ;;
+    esac
+done
 
 missing=
 for var in GOLINK_OAUTH_CLIENT_ID GOLINK_OAUTH_CLIENT_SECRET; do
@@ -58,11 +73,11 @@ else
 fi
 export GOLINK_REDIRECT_URL="${GOLINK_REDIRECT_URL:-http://localhost:$port/oauth2/callback}"
 
-podman compose -f compose.prod.yaml up -d --build --remove-orphans
-podman compose -f compose.prod.yaml restart nginx
+podman compose $compose_files up -d --build --remove-orphans
+podman compose $compose_files restart nginx
 
 echo
-echo "golink is at http://localhost:$port/ behind Google sign-in."
+echo "golink is at http://localhost:$port/ behind Google sign-in, links in $backend."
 echo "A request with no session is sent to Google; the identity comes back on"
 echo "the headers golink is told to read. If sign-in loops, check that the"
 echo "redirect URI registered with Google matches GOLINK_REDIRECT_URL."

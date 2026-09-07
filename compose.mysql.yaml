@@ -1,0 +1,70 @@
+# Puts the links in MySQL instead of in the SQLite file, for both local stacks.
+# It is an override, so it comes second:
+#
+#   podman compose -f compose.yaml      -f compose.mysql.yaml up -d --build
+#   podman compose -f compose.prod.yaml -f compose.mysql.yaml up -d --build
+#
+# which is what ./start-dev.sh --mysql and ./start-prod.sh --mysql do. The
+# golink service is defined the same way in both stacks, so one override serves
+# them both; what differs between the stacks is nginx and oauth2-proxy.
+#
+# What this is for is checking that golink says and does the same things on
+# MySQL as on SQLite, and that a schema created from schema-mysql.sql is the one
+# the queries expect. It is also the only way to run two instances against one
+# database locally, which SQLite cannot do at all -- the second process fails to
+# start with "database is locked".
+#
+# **The two backends hold different links.** Switching stacks does not carry
+# them across; /.export and ./import.sh --mysql do.
+#
+# The database is a named volume, not a directory in the working tree as the
+# SQLite file is, because a MySQL data directory is written by a user inside the
+# container and a bind mount makes that a permissions problem for no gain: this
+# copy is scratch, and "podman compose down -v" throws it away. In the cluster
+# the database is a managed MySQL and the DSN comes from a Secret.
+#
+#   podman compose -f compose.yaml -f compose.mysql.yaml exec mysql \
+#       mysql -ugolink -pgolink golink -e "SELECT Short, Owner FROM Links;"
+#   podman compose -f compose.yaml -f compose.mysql.yaml exec mysql \
+#       mysql -ugolink -pgolink golink -e "INSERT INTO Admins (Name) VALUES ('you@wetravel.com');"
+
+services:
+  golink:
+    # The whole command, since this replaces rather than edits the one in the
+    # file it overrides: -sqlitedb has to go, or golink refuses to start with
+    # two databases named.
+    command:
+      - -dev-listen=:8080
+      - -open-links
+      - -auth-email-header=X-Auth-Request-Email
+      - -auth-groups-header=X-Auth-Request-Groups
+    environment:
+      # A DSN is a credential, so it is in the environment rather than in the
+      # command above, where the process list would show it. This one reaches
+      # only a container on this machine's own network.
+      - GOLINK_MYSQL_DSN=golink:golink@tcp(mysql:3306)/golink
+    depends_on:
+      mysql:
+        # golink pings the database at startup and exits if it cannot reach it,
+        # which in the cluster is a crashloop with backoff -- the right
+        # behaviour there, and merely noisy here, so wait for the server.
+        condition: service_healthy
+
+  mysql:
+    image: docker.io/library/mysql:8.4
+    environment:
+      - MYSQL_DATABASE=golink
+      - MYSQL_USER=golink
+      - MYSQL_PASSWORD=golink
+      # Nothing here connects as root, so there is no reason to know it.
+      - MYSQL_RANDOM_ROOT_PASSWORD=yes
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-ugolink", "-pgolink"]
+      interval: 3s
+      timeout: 5s
+      retries: 30
+    volumes:
+      - golink-mysql:/var/lib/mysql
+
+volumes:
+  golink-mysql:

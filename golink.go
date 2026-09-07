@@ -69,6 +69,7 @@ var (
 	verbose           = flag.Bool("verbose", false, "be verbose")
 	controlURL        = flag.String("control-url", ipn.DefaultControlURL, "the URL base of the control plane (i.e. coordination server)")
 	sqlitefile        = flag.String("sqlitedb", "", "path of SQLite database to store links")
+	mysqlDSN          = flag.String("mysql", os.Getenv("GOLINK_MYSQL_DSN"), "if non-empty, store links in this MySQL database instead of in SQLite, in the form user:password@tcp(host:3306)/golink. Unlike a SQLite file it can be shared by several instances. It holds a password, so give it in the environment as GOLINK_MYSQL_DSN or in -config rather than on the command line")
 	dev               = flag.String("dev-listen", "", "if non-empty, listen on this addr and run in dev mode; auto-set sqlitedb if empty and don't use tsnet")
 	useHTTPS          = flag.Bool("https", true, "serve golink over HTTPS if enabled on tailnet")
 	snapshot          = flag.String("snapshot", "", "file path of snapshot file")
@@ -129,7 +130,7 @@ var LastSnapshot []byte
 var embeddedFS embed.FS
 
 // db stores short links.
-var db *SQLiteDB
+var db *DB
 
 var localClient *local.Client
 
@@ -169,13 +170,16 @@ func Run() error {
 	// restore links into an in-memory sqlite database.
 	if *resolveFromBackup != "" {
 		*sqlitefile = ":memory:"
+		// Resolving a name against a snapshot file needs no stored links, so
+		// this does not touch a configured MySQL database.
+		*mysqlDSN = ""
 		snapshot = resolveFromBackup
 		if flag.NArg() != 1 {
 			log.Fatal("--resolve-from-backup also requires a link to be resolved")
 		}
 	}
 
-	if *sqlitefile == "" {
+	if *mysqlDSN == "" && *sqlitefile == "" {
 		if devMode() {
 			tmpdir, err := os.MkdirTemp("", "golink_dev_*")
 			if err != nil {
@@ -184,12 +188,22 @@ func Run() error {
 			*sqlitefile = filepath.Join(tmpdir, "golink.db")
 			log.Printf("Dev mode temp db: %s", *sqlitefile)
 		} else {
-			return errors.New("--sqlitedb is required")
+			return errors.New("--sqlitedb or --mysql is required")
 		}
 	}
 
 	var err error
-	if db, err = NewSQLiteDB(*sqlitefile); err != nil {
+	if *mysqlDSN != "" {
+		if *sqlitefile != "" {
+			return errors.New("-mysql and -sqlitedb each name a database to store links in; give one, not both")
+		}
+		// The DSN holds a password, so it must not reach a log line. The
+		// driver's own errors name the address it failed to reach and not the
+		// DSN, and nothing here adds it.
+		if db, err = NewMySQLDB(*mysqlDSN); err != nil {
+			return fmt.Errorf("connecting to MySQL: %w", err)
+		}
+	} else if db, err = NewSQLiteDB(*sqlitefile); err != nil {
 		return fmt.Errorf("NewSQLiteDB(%q): %w", *sqlitefile, err)
 	}
 
@@ -536,12 +550,11 @@ func initMetrics() {
 // initMetricsData set metrics to what is represented in the DB
 func initMetricsData() error {
 	// Set the totalLinkCount metric to what is saved in the DB
-	var count float64
-	err := db.db.QueryRow("SELECT COUNT(DISTINCT id) FROM Links").Scan(&count)
+	count, err := db.LinkCount()
 	if err != nil {
 		return err
 	}
-	totalLinkCount.Set(count)
+	totalLinkCount.Set(float64(count))
 
 	return nil
 }
@@ -2095,29 +2108,13 @@ func serveExportStats(w http.ResponseWriter, _ *http.Request) {
 		return
 	}
 
-	rows, err := db.db.Query("SELECT ID, Created, Clicks FROM Stats ORDER BY Created, ID")
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer func() {
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	}()
-
-	for rows.Next() {
-		var id string
-		var created int64
-		var clicks int
-		err := rows.Scan(&id, &created, &clicks)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
+	err := db.StatRows(func(id string, created int64, clicks int) error {
 		// id is not permitted to contain commas, so no need to worry about CSV quoting
 		fmt.Fprintf(w, "%s,%d,%d\n", id, created, clicks)
+		return nil
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 	}
 }
 

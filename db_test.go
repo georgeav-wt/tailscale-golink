@@ -4,19 +4,63 @@
 package golink
 
 import (
+	"os"
 	"path"
+	"slices"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
-// Test saving, loading, and deleting links for SQLiteDB.
-func Test_SQLiteDB_SaveLoadDeleteLinks(t *testing.T) {
-	db, err := NewSQLiteDB(path.Join(t.TempDir(), "links.db"))
-	if err != nil {
-		t.Error(err)
+// testMySQLDSNEnv names a MySQL database for the storage tests to run against
+// instead of SQLite. Without it they run against SQLite only, so that the
+// suite needs no server; with it the same tests check that every statement is
+// read the same way by both databases, which is the property db.go rests on.
+//
+//	GOLINK_TEST_MYSQL_DSN='golink:golink@tcp(127.0.0.1:3306)/golink_test' go test ./...
+//
+// The tests empty the database first, so point it at one kept for testing. They
+// share it, and can do so because tests in a package run one at a time: do not
+// add t.Parallel to one that calls newTestDB.
+const testMySQLDSNEnv = "GOLINK_TEST_MYSQL_DSN"
+
+// newTestDB returns an empty database for a test to use.
+func newTestDB(t *testing.T) *DB {
+	t.Helper()
+
+	dsn := os.Getenv(testMySQLDSNEnv)
+	if dsn == "" {
+		db, err := NewSQLiteDB(path.Join(t.TempDir(), "links.db"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { db.db.Close() })
+		return db
 	}
+
+	db, err := NewMySQLDB(dsn)
+	if err != nil {
+		t.Fatalf("connecting to the MySQL database in $%s: %v", testMySQLDSNEnv, err)
+	}
+	t.Cleanup(func() { db.db.Close() })
+
+	// Every test wants an empty database, and this one is not thrown away
+	// between tests the way a temporary file is.
+	for _, table := range []string{"Links", "Admins", "Stats"} {
+		if _, err := db.db.Exec("DROP TABLE IF EXISTS " + table); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := execSchema(db.db, db.dialect); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+// Test saving, loading, and deleting links.
+func Test_DB_SaveLoadDeleteLinks(t *testing.T) {
+	db := newTestDB(t)
 
 	links := []*Link{
 		{Short: "short", Long: "long"},
@@ -69,11 +113,8 @@ func Test_SQLiteDB_SaveLoadDeleteLinks(t *testing.T) {
 
 // Test that the Admins table grants admin rights to both users and groups,
 // case-insensitively.
-func Test_SQLiteDB_IsAdmin(t *testing.T) {
-	db, err := NewSQLiteDB(path.Join(t.TempDir(), "links.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+func Test_DB_IsAdmin(t *testing.T) {
+	db := newTestDB(t)
 
 	// Admins are managed by hand, so add the rows the way an operator would.
 	if _, err := db.db.Exec(`INSERT INTO Admins (Name) VALUES ('Amelie@example.com')`); err != nil {
@@ -118,12 +159,9 @@ func Test_SQLiteDB_IsAdmin(t *testing.T) {
 	}
 }
 
-// Test saving, loading, and deleting stats for SQLiteDB.
-func Test_SQLiteDB_SaveLoadDeleteStats(t *testing.T) {
-	db, err := NewSQLiteDB(path.Join(t.TempDir(), "links.db"))
-	if err != nil {
-		t.Error(err)
-	}
+// Test saving, loading, and deleting stats.
+func Test_DB_SaveLoadDeleteStats(t *testing.T) {
+	db := newTestDB(t)
 
 	// preload some links
 	links := []*Link{
@@ -180,11 +218,8 @@ func Test_SQLiteDB_SaveLoadDeleteStats(t *testing.T) {
 }
 
 // Test GetLinksByOwner functionality
-func Test_SQLiteDB_GetLinksByOwner(t *testing.T) {
-	db, err := NewSQLiteDB(path.Join(t.TempDir(), "links.db"))
-	if err != nil {
-		t.Error(err)
-	}
+func Test_DB_GetLinksByOwner(t *testing.T) {
+	db := newTestDB(t)
 
 	// preload some links with owner
 	links := []*Link{
@@ -216,5 +251,55 @@ func Test_SQLiteDB_GetLinksByOwner(t *testing.T) {
 	}
 	if len(got) != 0 {
 		t.Errorf("db.GetLinksByOwner got %v; want empty slice", got)
+	}
+}
+
+// Test that a search matches the fields it should, and that a query made of
+// the characters LIKE reads as wildcards means itself. The escaping is the
+// part that differs between the two databases, so this is worth running
+// against both.
+func Test_DB_SearchLinks(t *testing.T) {
+	db := newTestDB(t)
+
+	for _, link := range []*Link{
+		{Short: "meeting-notes", Long: "https://docs.example.com/notes"},
+		{Short: "hr", Long: "https://app.hibob.com/employees"},
+		{Short: "code", Pattern: "https://github.com/search?q={{QueryEscape .Path}}"},
+		{Short: "pct", Long: "https://example.com/100%25?x=a_b!c"},
+	} {
+		if err := db.Save(link); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	tests := []struct {
+		query string
+		want  []string
+	}{
+		{query: "notes", want: []string{"meeting-notes"}},        // the short name
+		{query: "MEETING", want: []string{"meeting-notes"}},      // regardless of case
+		{query: "meetingnotes", want: []string{"meeting-notes"}}, // the ID, dashes ignored
+		{query: "hibob", want: []string{"hr"}},                   // the destination
+		{query: "github", want: []string{"code"}},                // the pattern
+		{query: "example.com", want: []string{"meeting-notes", "pct"}},
+		{query: "%", want: []string{"pct"}}, // a wildcard means itself
+		{query: "_", want: []string{"pct"}},
+		{query: "!", want: []string{"pct"}}, // including the escape character
+		{query: "nothing here", want: nil},
+	}
+	for _, tt := range tests {
+		links, err := db.SearchLinks(tt.query)
+		if err != nil {
+			t.Errorf("db.SearchLinks(%q) returned error: %v", tt.query, err)
+			continue
+		}
+		var got []string
+		for _, link := range links {
+			got = append(got, link.Short)
+		}
+		slices.Sort(got)
+		if !cmp.Equal(got, tt.want, cmpopts.EquateEmpty()) {
+			t.Errorf("db.SearchLinks(%q) = %v, want %v", tt.query, got, tt.want)
+		}
 	}
 }

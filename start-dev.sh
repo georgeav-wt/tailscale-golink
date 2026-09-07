@@ -5,6 +5,10 @@
 #
 #   ./start-dev.sh          # http://localhost:8080/
 #   ./start-dev.sh 80       # http://localhost/
+#   ./start-dev.sh --mysql  # links in a MySQL container, not the SQLite file
+#
+# The two backends hold different links, so --mysql is a different set of them,
+# not the same ones stored elsewhere. See compose.mysql.yaml.
 #
 # A port of 1024 or more is published on localhost only, since this stack has
 # no authentication and a laptop on a shared network would otherwise be serving
@@ -12,9 +16,21 @@
 # every address, never to a single one, and it warns about that below. Either
 # way no root is needed, because podman binds the port rather than golink.
 #
-# Data lives in the golink-data volume and survives this script, a rebuild, and
-# podman compose down. "podman compose down -v" is what throws it away.
+# Data lives in ./data and survives this script, a rebuild, and podman compose
+# down. With --mysql it lives in a named volume, which "podman compose down -v"
+# throws away.
 set -eu
+
+compose_files="-f compose.yaml"
+backend=SQLite
+while [ $# -gt 0 ]; do
+    case $1 in
+        --mysql)  compose_files="-f compose.yaml -f compose.mysql.yaml"; backend=MySQL; shift ;;
+        --sqlite) shift ;;
+        --*)      echo "unknown option: $1" >&2; exit 2 ;;
+        *)        break ;;
+    esac
+done
 
 port=${1:-${GOLINK_PORT:-8080}}
 
@@ -27,18 +43,21 @@ else
 fi
 export GOLINK_PUBLISH="$publish"
 
-podman compose up -d --build --remove-orphans
+# --remove-orphans so that switching between the two backends takes the
+# container of the one being left with it.
+podman compose $compose_files up -d --build --remove-orphans
 
 # nginx resolves golink's address once, at startup, and a rebuild gives the
 # container a new one. Without this, nginx serves 502 until it is restarted.
-podman compose restart nginx
+podman compose $compose_files restart nginx
 
 if curl -sf --retry 30 --retry-delay 1 --retry-connrefused --max-time 60 \
         -o /dev/null "http://localhost:$port/"; then
     echo
-    echo "golink is at http://localhost:$port/ -- every visitor is dev@wetravel.com."
+    echo "golink is at http://localhost:$port/ -- every visitor is dev@wetravel.com,"
+    echo "and the links are in $backend."
     echo "Try http://localhost:$port/fadsfads to see the create-on-404 form."
-    echo "Audit log: podman compose logs -f golink"
+    echo "Audit log: podman compose $compose_files logs -f golink"
     if [ "$exposed" = yes ]; then
         echo
         echo "WARNING: port $port is published on every address, not just localhost,"
@@ -50,6 +69,6 @@ if curl -sf --retry 30 --retry-delay 1 --retry-connrefused --max-time 60 \
         echo "  echo \"rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port $port -> 127.0.0.1 port 8080\" | sudo pfctl -Ef -"
     fi
 else
-    echo "golink did not come up; try: podman compose logs" >&2
+    echo "golink did not come up; try: podman compose $compose_files logs" >&2
     exit 1
 fi

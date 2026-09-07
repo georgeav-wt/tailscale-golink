@@ -129,7 +129,7 @@ the diff a strict addition rather than a change of semantics, which is the only
 version of this that has any chance upstream. **We run with `-open-links`.**
 
 - `schema.sql`: `Locked INTEGER NOT NULL DEFAULT 0`. There is deliberately **no
-  migration code**; see the note under step 15 for what that means the day a column is
+  migration code**; see the note under step 16 for what that means the day a column is
   added after deploying.
 - `db.go`: `Locked bool` on `Link`, tagged `json:",omitempty"` so `/.export` snapshots
   of unlocked links stay byte-identical to upstream's.
@@ -639,7 +639,104 @@ needed, **provided every pod is given the same `--cookie-secret`**. A generated 
 says so on the way past. If Admin SDK group membership makes the cookie large, raise nginx's
 `proxy_buffer_size`.
 
-### 15. Deployment shape
+### 15. MySQL as a backend (**done**, commit `golink,db: store links in MySQL as well as SQLite`)
+
+`-mysql user:password@tcp(host:3306)/golink` stores the links in MySQL instead of
+in a SQLite file, which is what makes more than one replica possible at all: two
+processes cannot share one SQLite file, and the second to start simply dies with
+`database is locked (5)`. With MySQL, **verified with two instances against one
+database**: a link created on A resolves on B, a form rendered by A is accepted by
+B, and the clicks each recorded converge to the same total on both.
+
+**One implementation, two dialects.** `DB` holds a `*sql.DB` and a `dialect`, and
+every statement is written so that both databases read it the same way. Two sets of
+queries would be twice the surface to keep right, and this fork has already broken
+one of four copies of a query twice. What is actually dialect-specific is small:
+
+| | why |
+|---|---|
+| `REPLACE INTO` | the long `INSERT OR REPLACE` is SQLite's spelling; the short one is in both |
+| a REPLACE affects **2** rows in MySQL | it counts the delete and the insert; `dialect.replacedOneRow` allows either |
+| `?` and never `?1` | MySQL has no numbered placeholders, so a repeated value is passed twice |
+| `` `Long` `` in every statement naming it | **`LONG` is a reserved word in MySQL** and cannot be a bare identifier anywhere. SQLite reads a backtick as a quote for exactly this compatibility. This is why `SearchLinks` builds its query with `"` strings: a Go raw string cannot contain a backtick |
+| `ESCAPE '!'` | MySQL reads a backslash inside a string literal before LIKE ever sees it. `containsPattern` escapes with `!` to match, and `Test_DB_SearchLinks` checks that `%`, `_` and `!` all mean themselves |
+| the schema | separate files, since the types and the DDL differ |
+
+**The schema.** `schema-mysql.sql` is `schema.sql` in MySQL's spelling and has to be
+kept in step with it by hand. What differs, and why:
+
+- `TEXT`/`INTEGER` become `VARCHAR(255)`/`BIGINT`, since a MySQL primary key needs a
+  length. `Locked` is `TINYINT(1)`, which `database/sql` scans into a `bool`.
+- `COLLATE NOCASE` on the Admins primary key becomes the table collation
+  `utf8mb4_general_ci`, which is what makes the same name in two cases one row.
+- **A MySQL `TEXT` column may not have a default**, so `Long` and `Pattern` have none
+  and a row inserted by hand must give them. golink always does.
+- `DEFAULT (UNIX_TIMESTAMP())` stands in for `strftime('%s','now')`, and needs
+  **MySQL 8.0.13 or newer**. The `CHECK` on Admins needs 8.0.16. Both are only
+  reached by a row inserted by hand, but a create would fail on an older server.
+- The schema is applied **one statement at a time**: MySQL's driver refuses several
+  in one `Exec` unless the DSN carries `multiStatements`, which is a setting that
+  widens what any SQL injection could reach. `execSchema` splits on the semicolons
+  after stripping the `--` comments, so a semicolon inside a comment is harmless --
+  and there is one in each file, which is how that bug was found.
+
+**Choosing one.** `-mysql` with `-sqlitedb` is a startup error rather than a silent
+preference, since each names a database and a guess would be the wrong kind of
+convenience. `-resolve-from-backup` ignores both, resolving against the snapshot file
+in an in-memory database. **The DSN is a credential**: it defaults to
+`$GOLINK_MYSQL_DSN`, belongs in the environment or `-config`, and no error mentions
+it -- verified for an unreachable server, a malformed DSN and the both-flags case,
+none of which printed the password.
+
+**What is still per-process** is the `sync.RWMutex`, which is there for SQLite's
+single writer. Two instances saving the same link at once is therefore last-write-
+wins on the whole row, which is what it was between two browser tabs already; links
+are edited by hand, seconds apart at worst.
+
+**Connections** are capped at 8 with a 3-minute lifetime, so golink does not sit
+holding one that a failover or a proxy has taken away underneath it. If the database
+is unreachable at startup golink exits, which in the cluster is a crashloop with
+backoff -- the right behaviour, since it will be restarted until MySQL answers.
+
+**Testing against a real MySQL.** The storage tests run against SQLite by default, so
+`go test ./...` needs no server. Point `$GOLINK_TEST_MYSQL_DSN` at a database and the
+same tests run against that instead, which is the only thing that can prove the
+statements above are read the same way by both:
+
+```sh
+podman run -d --name golink-mysql-test -e MYSQL_ROOT_PASSWORD=root \
+    -e MYSQL_DATABASE=golink_test -p 3307:3306 docker.io/library/mysql:8.4
+GOLINK_TEST_MYSQL_DSN='root:root@tcp(127.0.0.1:3307)/golink_test' go test ./...
+```
+
+They empty the database first, so give them one kept for testing. `newTestDB` is the
+seam; the tests that go through the handlers still use SQLite in memory, because what
+they are testing is not the storage.
+
+**Locally**, `compose.mysql.yaml` is an override that swaps the backend of *either*
+stack -- the golink service is defined identically in both -- and
+`./start-dev.sh --mysql`, `./start-prod.sh --mysql` and `./import.sh --mysql` pass it.
+The two backends hold **different links**; nothing carries them across but `/.export`
+and `import.sh`. Its data is a named volume rather than a directory in the tree,
+unlike the SQLite file, because a MySQL data directory is written from inside the
+container and a bind mount makes that a permissions problem for nothing; `podman
+compose down -v` throws it away. Admins are managed with the `mysql` client instead
+of `sqlite3`:
+
+```sh
+podman compose -f compose.yaml -f compose.mysql.yaml exec mysql \
+    mysql -ugolink -pgolink golink -e "INSERT INTO Admins (Name) VALUES ('you@wetravel.com');"
+```
+
+`import.sh` now runs the importer as a one-off container of the golink **service**
+(`podman compose run --build golink`), which is what puts it on the same network and
+gives it the same database and environment as the stack. It used to run the image
+directly with the volume named on the command line, which cannot reach a MySQL
+container. The `--build` matters: without it the import runs whatever the image was
+built from last, which was how "--sqlitedb is required" came out of a run whose
+environment plainly had a DSN in it.
+
+### 16. Deployment shape
 
 nginx → oauth2-proxy (Google) → golink:
 
@@ -651,7 +748,10 @@ nginx → oauth2-proxy (Google) → golink:
 Add `-owner-can-lock` if locking should not be an admin-only decision, and
 `-admin-only-export` to hold the whole-link-set export to admins.
 
-For more than one replica, two Secret values must be **the same in every pod** — golink's
+With MySQL instead, `-mysql` from `$GOLINK_MYSQL_DSN` in a Secret, and no PVC; that
+is what more than one replica needs (step 15).
+
+For more than one replica, two Secret values must be **the same in every pod** -- golink's
 `GOLINK_XSRF_KEY` and oauth2-proxy's `--cookie-secret`. See step 14; note that SQLite
 on a PVC cannot back more than one pod at all.
 
@@ -659,15 +759,17 @@ Forgetting `-open-links` silently gives you upstream's owner-locked model.
 Forgetting `-auth-email-header` silently makes **everyone** `foo@example.com`,
 the dev-mode user — the one failure here that is silent rather than closed,
 so assert on it after deploying: create a link and check its owner.
-SQLite on a PVC, single replica. Image runs as uid 65532 with home `/home/nonroot`.
+SQLite on a PVC means a single replica; MySQL is what lifts that. Image runs as
+uid 65532 with home `/home/nonroot`.
 Back up via `-snapshot` and `/.export` (JSON Lines).
 
 **There is no schema migration, and that only bites after this is deployed.**
+(And there are now two schema files to add the column to, not one.)
 `schema.sql` is executed on every start, and `CREATE TABLE IF NOT EXISTS` creates a
 missing *table* but never adds a column to a table that is already there. So a column
 added once the PVC holds data will simply be absent, and every query naming it will
-fail. Adding one then means putting an `ALTER TABLE` back into `NewSQLiteDB` or running
-it by hand against the PVC. There was such a migration during development, for
+fail. Adding one then means putting an `ALTER TABLE` back into `newDB`, for whichever
+dialects are in use, or running it by hand against the database. There was such a migration during development, for
 databases that only ever existed on one laptop; the shape to copy is in
 
 ```sh
@@ -692,8 +794,12 @@ callers:
 ```bash
 ./start-dev.sh          # http://localhost:8080/, loopback only
 ./start-dev.sh 80       # http://localhost/
+./start-dev.sh --mysql  # the same, with the links in MySQL rather than SQLite
 open http://localhost:8080/fadsfads   # should render the create form, name pre-filled
 ```
+
+`--mysql` works on `start-prod.sh` and `import.sh` too, and is a **different set of
+links**: see step 15.
 
 `start-prod.sh` runs the same three parts as the cluster -- nginx, a real
 oauth2-proxy against Google, golink -- on this machine, from `compose.prod.yaml`.
@@ -722,7 +828,8 @@ between the dev and the production stack, taking the links with it, and the loss
 not reproducible afterwards. A directory in the working tree cannot be removed by
 anything compose does -- verified against `podman compose down -v` -- and it also means
 `sqlite3 data/golink.db` works from the host, which is how admins are added locally.
-`./import.sh <export.jsonl>` restores an export into it.
+`./import.sh <export.jsonl>` restores an export into it, and
+`./import.sh --mysql <export.jsonl>` into the MySQL container instead.
 
 **Mounting a file from `/tmp` fails on macOS.** The podman VM has `/private/tmp` and
 `/Users`, and `/tmp` is only a symlink to the first of those, so `-v /tmp/x:/x` gives

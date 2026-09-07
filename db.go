@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	_ "modernc.org/sqlite"
 	"tailscale.com/tstime"
 )
@@ -103,42 +104,157 @@ func linkID(short string) string {
 	return id
 }
 
-// SQLiteDB stores Links in a SQLite database.
-type SQLiteDB struct {
-	db *sql.DB
-	mu sync.RWMutex
+// DB stores Links in a SQL database, either SQLite or MySQL.
+//
+// Which of the two it is makes almost no difference past the connection: every
+// statement below is written so that both accept it, which is cheaper to keep
+// right than two sets of queries would be. The exceptions live in dialect.
+type DB struct {
+	db      *sql.DB
+	dialect dialect
+	mu      sync.RWMutex
 
 	clock tstime.Clock // allow overriding time for tests
+}
+
+// dialect is the little that differs between the two databases.
+type dialect struct {
+	// name is what to call this database in a message.
+	name string
+	// schema is the DDL that brings an empty database up to date. It is
+	// applied on every start, and creates only what is missing; it does not
+	// alter a table that already exists. See CLAUDE.md.
+	schema string
+	// countsReplaceTwice says the database reports a REPLACE that replaced an
+	// existing row as having affected two rows, counting the delete and the
+	// insert separately, as MySQL does.
+	countsReplaceTwice bool
 }
 
 //go:embed schema.sql
 var sqlSchema string
 
-// NewSQLiteDB returns a new SQLiteDB that stores links in a SQLite database stored at f.
-func NewSQLiteDB(f string) (*SQLiteDB, error) {
+//go:embed schema-mysql.sql
+var mysqlSchema string
+
+// replacedOneRow reports whether a REPLACE meant to write a single row did.
+func (d dialect) replacedOneRow(rows int64) bool {
+	return rows == 1 || (d.countsReplaceTwice && rows == 2)
+}
+
+// NewSQLiteDB returns a new DB that stores links in a SQLite database stored at f.
+func NewSQLiteDB(f string) (*DB, error) {
 	db, err := sql.Open("sqlite", f)
 	if err != nil {
 		return nil, err
 	}
-	if err := db.Ping(); err != nil {
+	return newDB(db, dialect{name: "SQLite", schema: sqlSchema})
+}
+
+// NewMySQLDB returns a new DB that stores links in the MySQL database the DSN
+// names, in the form user:password@tcp(host:3306)/golink.
+//
+// Unlike a SQLite file, one MySQL database can back more than one instance of
+// golink; see CLAUDE.md for what else that takes.
+func NewMySQLDB(dsn string) (*DB, error) {
+	cfg, err := mysql.ParseDSN(dsn)
+	if err != nil {
+		// The driver's own parse errors say what is wrong without quoting the
+		// DSN, which holds a password. Checked, and worth re-checking if this
+		// ever wraps something else.
 		return nil, err
 	}
-
-	if _, err = db.Exec(sqlSchema); err != nil {
+	// A query carries no deadline of its own, so a database that has stopped
+	// answering -- rather than refusing, which fails at once -- would wedge
+	// every request behind it until something restarted golink. These are
+	// defaults: a DSN that sets them keeps its own values.
+	if cfg.Timeout == 0 {
+		cfg.Timeout = 5 * time.Second
+	}
+	if cfg.ReadTimeout == 0 {
+		cfg.ReadTimeout = 10 * time.Second
+	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = 10 * time.Second
+	}
+	connector, err := mysql.NewConnector(cfg)
+	if err != nil {
 		return nil, err
 	}
+	db := sql.OpenDB(connector)
+	// A handful of connections is plenty for a link shortener, and retiring
+	// them keeps golink from holding one that a proxy or a failover has
+	// silently taken away underneath it.
+	db.SetMaxOpenConns(8)
+	db.SetMaxIdleConns(2)
+	db.SetConnMaxLifetime(3 * time.Minute)
+	// Shorter than any wait_timeout or idle middlebox is likely to be, because
+	// a connection closed at the far end is handed out again and fails the
+	// query rather than being retried: this driver's "invalid connection" is
+	// not the error database/sql retries on. Observed once, during a flush.
+	db.SetConnMaxIdleTime(time.Minute)
+	return newDB(db, dialect{name: "MySQL", schema: mysqlSchema, countsReplaceTwice: true})
+}
 
-	return &SQLiteDB{db: db}, nil
+// newDB connects, applies the schema and returns the DB.
+func newDB(sqlDB *sql.DB, d dialect) (*DB, error) {
+	if err := sqlDB.Ping(); err != nil {
+		return nil, err
+	}
+	if err := execSchema(sqlDB, d); err != nil {
+		return nil, err
+	}
+	return &DB{db: sqlDB, dialect: d}, nil
+}
+
+// execSchema applies a schema one statement at a time.
+//
+// Handing several statements to a single Exec works in SQLite but not in
+// MySQL, whose driver refuses them unless the DSN carries multiStatements,
+// which is a setting that widens what any SQL injection could reach. Splitting
+// them here keeps that out of the DSN.
+//
+// Comments are removed before the split, so a semicolon in one of them is
+// harmless; a schema file may not contain a semicolon inside a string literal,
+// and neither of ours does.
+func execSchema(db *sql.DB, d dialect) error {
+	for i, stmt := range strings.Split(withoutSQLComments(d.schema), ";") {
+		if strings.TrimSpace(stmt) == "" {
+			continue // the whitespace after the last statement
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			return fmt.Errorf("%s schema statement %d: %w", d.name, i+1, err)
+		}
+	}
+	return nil
+}
+
+// withoutSQLComments returns s with its -- comments removed, so that neither a
+// semicolon nor a statement can be hiding in one.
+func withoutSQLComments(s string) string {
+	var b strings.Builder
+	for line := range strings.SplitSeq(s, "\n") {
+		if i := strings.Index(line, "--"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
 }
 
 // Now returns the current time.
-func (s *SQLiteDB) Now() time.Time {
+func (s *DB) Now() time.Time {
 	return tstime.DefaultClock{Clock: s.clock}.Now()
 }
 
 // linkColumns are the columns of the Links table that make up a Link, in the
 // order scanLink reads them.
-const linkColumns = "Short, Long, Pattern, Created, LastEdit, LastEditBy, Owner, Locked"
+//
+// Long is quoted because LONG is a reserved word in MySQL, which rejects it as
+// a bare identifier anywhere, DDL and queries alike. SQLite reads a backtick
+// as a quote too, for exactly this compatibility.
+const linkColumns = "Short, `Long`, Pattern, Created, LastEdit, LastEditBy, Owner, Locked"
 
 // scanLink reads a single Link from a query result.
 func scanLink(row interface{ Scan(...any) error }) (*Link, error) {
@@ -170,7 +286,7 @@ func scanLinks(rows *sql.Rows) ([]*Link, error) {
 // LoadAll returns all stored Links.
 //
 // The caller owns the returned values.
-func (s *SQLiteDB) LoadAll() ([]*Link, error) {
+func (s *DB) LoadAll() ([]*Link, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -186,11 +302,11 @@ func (s *SQLiteDB) LoadAll() ([]*Link, error) {
 // It returns fs.ErrNotExist if the link does not exist.
 //
 // The caller owns the returned value.
-func (s *SQLiteDB) Load(short string) (*Link, error) {
+func (s *DB) Load(short string) (*Link, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	row := s.db.QueryRow("SELECT "+linkColumns+" FROM Links WHERE ID = ?1 LIMIT 1", linkID(short))
+	row := s.db.QueryRow("SELECT "+linkColumns+" FROM Links WHERE ID = ? LIMIT 1", linkID(short))
 	link, err := scanLink(row)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -202,11 +318,13 @@ func (s *SQLiteDB) Load(short string) (*Link, error) {
 }
 
 // Save saves a Link.
-func (s *SQLiteDB) Save(link *Link) error {
+func (s *DB) Save(link *Link) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	result, err := s.db.Exec("INSERT OR REPLACE INTO Links (ID, Short, Long, Pattern, Created, LastEdit, LastEditBy, Owner, Locked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", linkID(link.Short), link.Short, link.Long, link.Pattern, link.Created.Unix(), link.LastEdit.Unix(), link.LastEditBy, link.Owner, boolToInt(link.Locked))
+	// REPLACE rather than INSERT OR REPLACE: the short form is the one both
+	// databases accept, and it means the same thing in each.
+	result, err := s.db.Exec("REPLACE INTO Links (ID, Short, `Long`, Pattern, Created, LastEdit, LastEditBy, Owner, Locked) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", linkID(link.Short), link.Short, link.Long, link.Pattern, link.Created.Unix(), link.LastEdit.Unix(), link.LastEditBy, link.Owner, boolToInt(link.Locked))
 	if err != nil {
 		return err
 	}
@@ -214,13 +332,13 @@ func (s *SQLiteDB) Save(link *Link) error {
 	if err != nil {
 		return err
 	}
-	if rows != 1 {
+	if !s.dialect.replacedOneRow(rows) {
 		return fmt.Errorf("expected to affect 1 row, affected %d", rows)
 	}
 	return nil
 }
 
-// boolToInt returns the integer SQLite stores for a boolean column.
+// boolToInt returns the integer a boolean column is stored as.
 func boolToInt(b bool) int {
 	if b {
 		return 1
@@ -229,7 +347,7 @@ func boolToInt(b bool) int {
 }
 
 // Delete removes a Link using its short name.
-func (s *SQLiteDB) Delete(short string) error {
+func (s *DB) Delete(short string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -257,7 +375,7 @@ const adminGroupPrefix = "group:"
 // The table is managed by the operator, directly in the database; golink never
 // writes to it. It is empty by default, in which case admin rights come only
 // from the tailnet ACL grant, as they always have.
-func (s *SQLiteDB) IsAdmin(login string, groups []string) (bool, error) {
+func (s *DB) IsAdmin(login string, groups []string) (bool, error) {
 	// The names that would make this user an admin, if any of them is listed.
 	var names []any
 	if login != "" {
@@ -284,7 +402,7 @@ func (s *SQLiteDB) IsAdmin(login string, groups []string) (bool, error) {
 }
 
 // LoadStats returns click stats for links.
-func (s *SQLiteDB) LoadStats() (ClickStats, error) {
+func (s *DB) LoadStats() (ClickStats, error) {
 	allLinks, err := s.LoadAll()
 	if err != nil {
 		return nil, err
@@ -318,7 +436,7 @@ func (s *SQLiteDB) LoadStats() (ClickStats, error) {
 // SaveStats records click stats for links.  The provided map includes
 // incremental clicks that have occurred since the last time SaveStats
 // was called.
-func (s *SQLiteDB) SaveStats(stats ClickStats) error {
+func (s *DB) SaveStats(stats ClickStats) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -338,7 +456,7 @@ func (s *SQLiteDB) SaveStats(stats ClickStats) error {
 }
 
 // DeleteStats deletes click stats for a link.
-func (s *SQLiteDB) DeleteStats(short string) error {
+func (s *DB) DeleteStats(short string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -350,7 +468,7 @@ func (s *SQLiteDB) DeleteStats(short string) error {
 }
 
 // GetLinksByOwner returns all Links owned by the specified owner.
-func (s *SQLiteDB) GetLinksByOwner(owner string) ([]*Link, error) {
+func (s *DB) GetLinksByOwner(owner string) ([]*Link, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -365,16 +483,20 @@ func (s *SQLiteDB) GetLinksByOwner(owner string) ([]*Link, error) {
 // contains query, matched without regard to case. Dashes are ignored in the
 // short name, as they are when resolving a link, so that "meetingnotes" finds
 // "meeting-notes".
-func (s *SQLiteDB) SearchLinks(query string) ([]*Link, error) {
+func (s *DB) SearchLinks(query string) ([]*Link, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.Query(`SELECT `+linkColumns+` FROM Links WHERE
-		Short LIKE ?1 ESCAPE '\' OR
-		Long LIKE ?1 ESCAPE '\' OR
-		Pattern LIKE ?1 ESCAPE '\' OR
-		ID LIKE ?2 ESCAPE '\'`,
-		containsPattern(query), containsPattern(linkID(query)))
+	// The pattern is repeated rather than numbered, and escaped with ! rather
+	// than a backslash, because MySQL accepts neither ?1 nor a lone backslash
+	// in a string literal. Both are read the same way by SQLite.
+	contains, containsID := containsPattern(query), containsPattern(linkID(query))
+	rows, err := s.db.Query("SELECT "+linkColumns+" FROM Links WHERE "+
+		"Short LIKE ? ESCAPE '!' OR "+
+		"`Long` LIKE ? ESCAPE '!' OR "+
+		"Pattern LIKE ? ESCAPE '!' OR "+
+		"ID LIKE ? ESCAPE '!'",
+		contains, contains, contains, containsID)
 	if err != nil {
 		return nil, err
 	}
@@ -382,16 +504,55 @@ func (s *SQLiteDB) SearchLinks(query string) ([]*Link, error) {
 }
 
 // containsPattern returns a SQL LIKE pattern matching any string that contains
-// s, with the wildcards LIKE would otherwise read in s escaped.
+// s, with the wildcards LIKE would otherwise read in s escaped. The escape
+// character is ! rather than a backslash, which MySQL reads inside a string
+// literal before LIKE ever sees it; the queries say ESCAPE '!' to match.
 func containsPattern(s string) string {
 	var b strings.Builder
 	b.WriteByte('%')
 	for _, r := range s {
-		if r == '\\' || r == '%' || r == '_' {
-			b.WriteByte('\\')
+		if r == '!' || r == '%' || r == '_' {
+			b.WriteByte('!')
 		}
 		b.WriteRune(r)
 	}
 	b.WriteByte('%')
 	return b.String()
+}
+
+// LinkCount returns how many links are stored, for the metric of that name.
+func (s *DB) LinkCount() (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var count int
+	err := s.db.QueryRow("SELECT COUNT(DISTINCT ID) FROM Links").Scan(&count)
+	return count, err
+}
+
+// StatRows calls f for each row of the Stats ledger, oldest first. Each row is
+// the clicks one link received in the minute Created names, so a link has as
+// many rows as it has had minutes with a click in them.
+func (s *DB) StatRows(f func(id string, created int64, clicks int) error) error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query("SELECT ID, Created, Clicks FROM Stats ORDER BY Created, ID")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var id string
+		var created int64
+		var clicks int
+		if err := rows.Scan(&id, &created, &clicks); err != nil {
+			return err
+		}
+		if err := f(id, created, clicks); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }

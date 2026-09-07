@@ -9,7 +9,14 @@
     // Serve plain HTTP on this address rather than joining a tailnet.
     // Something in front has to authenticate the request; see deploy/nginx/.
     "dev-listen": ":8080",
+
+    // Where the links are kept. A SQLite file is one instance only; MySQL is
+    // what more than one takes, and giving both is a startup error. A DSN
+    // holds a password, so prefer $GOLINK_MYSQL_DSN, or keep this file
+    // readable only by the user golink runs as -- and never put it on the
+    // command line, where the process list would show it.
     "sqlitedb": "/home/nonroot/golink.db",
+    // "mysql": "golink:password@tcp(mysql.internal:3306)/golink",
 
     // Anyone may edit any link that is not locked. Without this, a link
     // belongs to whoever made it, which is upstream's model.

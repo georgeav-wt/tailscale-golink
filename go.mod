@@ -3,6 +3,7 @@ module github.com/tailscale/golink
 go 1.26.6
 
 require (
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/google/go-cmp v0.7.0
 	github.com/prometheus/client_golang v1.23.2
 	github.com/tailscale/hujson v0.0.0-20260302212456-ecc657c15afd

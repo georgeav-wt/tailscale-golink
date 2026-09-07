@@ -418,6 +418,36 @@ is an admin in addition to anyone granted admin by an ACL grant; an empty table
 grants nothing. Note that the table is not part of a `/.export` snapshot, so
 back it up separately.
 
+## Storing links in MySQL
+
+Links are kept in a SQLite file by default. `-mysql` puts them in MySQL instead,
+which is what lets more than one instance serve the same links:
+
+    GOLINK_MYSQL_DSN='golink:password@tcp(mysql:3306)/golink' golink -dev-listen :8080
+
+The DSN is the [go-sql-driver] form, `user:password@tcp(host:3306)/database`. It is
+a credential, so give it in the environment or the configuration file (as `"mysql"`)
+rather than on the command line. Giving both `-mysql` and `-sqlitedb` is an error at
+startup rather than a guess about which you meant.
+
+golink creates the tables it needs on every start, from `schema-mysql.sql`, and never
+alters a table that already exists. **MySQL 8.0.13 or newer** is needed for the
+timestamp defaults, and 8.0.16 for the constraint on the `Admins` table; both are only
+reached by a row you insert yourself.
+
+Everything else behaves the same, including `/.export`, which is still the portable
+backup and the only thing that carries links from one backend to the other. Admins are
+listed the same way, with the `mysql` client instead of `sqlite3`:
+
+    mysql golink -e "INSERT INTO Admins (Name) VALUES ('you@example.com');"
+
+Connections are capped at 8, retired after three minutes, and given connect, read and
+write deadlines, so that a database which has stopped answering fails requests instead
+of hanging them. A DSN that sets `timeout`, `readTimeout` or `writeTimeout` keeps its
+own values.
+
+[go-sql-driver]: https://github.com/go-sql-driver/mysql#dsn-data-source-name
+
 ## Running more than one instance
 
 Several golink processes can serve the same links, provided two things are shared.
@@ -441,7 +471,7 @@ session minted by one is not readable by the next.
 Two other things follow from more than one instance:
 
  - **The database has to be one they can share.** Two processes cannot use one SQLite
-   file: the second to start fails with `database is locked`.
+   file: the second to start fails with `database is locked`. Use `-mysql` instead.
  - **Click counts converge rather than being exact.** Each instance counts clicks in
    memory and writes what it has counted every five seconds, then reads the totals
    back, so a link's count includes every instance's clicks within a flush. A
