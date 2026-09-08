@@ -478,6 +478,23 @@ Two other things follow from more than one instance:
    `SIGINT` or `SIGTERM` flushes once before exiting, so a rolling restart does not
    throw away the last few seconds; a `SIGKILL` does.
 
+## Health checks
+
+`-healthcheck-path` answers one path with the health of the instance instead of
+treating it as a link name:
+
+    golink -healthcheck-path /healthcheck ...
+
+It reports 200 when the database answers and 503 when it does not, so a load
+balancer stops sending requests to an instance that cannot serve them. The
+response says nothing else — the reason for a failure goes to the log, not to
+whoever asked.
+
+Unset, there is no such endpoint and every name is a link, which is why the path
+is a flag rather than a fixed route: the one you give it stops being usable as a
+link, and golink says so at startup. Pick one your platform asks for — Kubernetes
+probes and most agents default to `/healthcheck`.
+
 ## Backups
 
 Once you have golink running, you can back up all of your links in [JSON lines] format from <http://go/.export>.

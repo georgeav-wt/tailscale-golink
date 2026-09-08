@@ -81,6 +81,7 @@ var (
 	openLinks         = flag.Bool("open-links", false, "allow any user to edit any link that its owner has not locked")
 	ownerCanLock      = flag.Bool("owner-can-lock", false, "let the owner of a link lock it, as well as an admin; only meaningful with -open-links")
 	adminOnlyExport   = flag.Bool("admin-only-export", false, "let only admins export every link at once, and stop offering the export, stats and metrics URLs to anybody else")
+	healthcheckPath   = flag.String("healthcheck-path", "", `if non-empty, answer this path with the health of this instance rather than treating it as a link name, for the probes of whatever runs it (e.g. "/healthcheck")`)
 	xsrfKeyFlag       = flag.String("xsrf-key", os.Getenv("GOLINK_XSRF_KEY"), "secret the XSRF tokens in forms are signed with, shared by every instance serving the same links; without it each instance invents its own and refuses the forms of the others. It is a credential, so give it in the environment or -config rather than on the command line")
 	authEmailHeader   = flag.String("auth-email-header", "", `if non-empty, identify users by this HTTP header, set by an authenticating proxy in front of golink (e.g. "X-Auth-Request-Email"), rather than by their tailnet identity`)
 	authGroupsHeader  = flag.String("auth-groups-header", "", `HTTP header holding the comma-separated groups a user belongs to (e.g. "X-Auth-Request-Groups"); only read when -auth-email-header is set`)
@@ -140,6 +141,17 @@ func Run() error {
 	if *configFile != "" {
 		if err := loadConfig(flag.CommandLine, *configFile); err != nil {
 			return fmt.Errorf("reading %s: %w", *configFile, err)
+		}
+	}
+
+	if *healthcheckPath != "" {
+		if !strings.HasPrefix(*healthcheckPath, "/") {
+			return fmt.Errorf("-healthcheck-path %q does not begin with /", *healthcheckPath)
+		}
+		if !strings.HasPrefix(*healthcheckPath, "/.") {
+			// Worth saying out loud: this is the one name that stops being a
+			// link, and a link of that name would simply stop resolving.
+			log.Printf("answering %s with a healthcheck; no link of that name can be reached", *healthcheckPath)
 		}
 	}
 
@@ -691,6 +703,17 @@ func serveHandler() http.Handler {
 	mux.Handle("/.static/", http.StripPrefix("/.", http.FileServer(http.FS(embeddedFS))))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A probe is answered ahead of everything else, and outside the mux,
+		// because the path it asks for is not golink's to choose: Kubernetes
+		// probes and the Datadog service check both want /healthcheck, which
+		// does not begin with the "." that marks golink's own URLs and would
+		// otherwise be read as a link name. Nothing is claimed unless
+		// -healthcheck-path names it.
+		if *healthcheckPath != "" && r.URL.Path == *healthcheckPath {
+			serveHealthcheck(w, r)
+			return
+		}
+
 		// Never send a Referer header to link destinations, which would
 		// otherwise expose the golink host (and thus the tailnet name) to
 		// external sites. Setting the policy on redirect responses also
@@ -707,6 +730,23 @@ func serveHandler() http.Handler {
 		}
 		mux.ServeHTTP(w, r)
 	})
+}
+
+// serveHealthcheck answers whether this instance can serve links, which means
+// asking the database: one that cannot reach it can do nothing useful, and a
+// load balancer that goes on sending requests to it serves errors instead of
+// passing them to an instance that can.
+//
+// It says nothing about who is asking, so it must not say anything a stranger
+// should not hear: the detail of a failure goes to the log, and the response is
+// the same sentence however it failed.
+func serveHealthcheck(w http.ResponseWriter, _ *http.Request) {
+	if err := db.Ping(); err != nil {
+		log.Printf("healthcheck: %v", err)
+		http.Error(w, "database unreachable", http.StatusServiceUnavailable)
+		return
+	}
+	io.WriteString(w, "ok\n")
 }
 
 func serveHome(w http.ResponseWriter, r *http.Request, short string) {

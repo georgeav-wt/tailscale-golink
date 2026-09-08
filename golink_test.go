@@ -1508,6 +1508,51 @@ func TestFlushStatsReloadsTotals(t *testing.T) {
 	}
 }
 
+// TestServeHealthcheck tests the endpoint whatever runs golink probes: that it
+// is answered only when it has been named, that it reports the database, and
+// that a name it is not given goes on being a link.
+func TestServeHealthcheck(t *testing.T) {
+	var err error
+	db, err = NewSQLiteDB(":memory:")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Save(&Link{Short: "healthcheck", Long: "http://link/"})
+
+	get := func(t *testing.T, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		w := httptest.NewRecorder()
+		serveHandler().ServeHTTP(w, httptest.NewRequest("GET", path, nil))
+		return w
+	}
+
+	// Unnamed, the path is an ordinary link and resolves as one.
+	if got := get(t, "/healthcheck"); got.Code != http.StatusFound {
+		t.Errorf("/healthcheck without -healthcheck-path = %d; want 302, the link of that name", got.Code)
+	}
+
+	*healthcheckPath = "/healthcheck"
+	t.Cleanup(func() { *healthcheckPath = "" })
+
+	got := get(t, "/healthcheck")
+	if got.Code != http.StatusOK {
+		t.Errorf("/healthcheck = %d; want 200", got.Code)
+	}
+	if body := got.Body.String(); body != "ok\n" {
+		t.Errorf("/healthcheck said %q; want %q", body, "ok\n")
+	}
+
+	// A database that cannot be reached is the case the probe exists for.
+	db.db.Close()
+	got = get(t, "/healthcheck")
+	if got.Code != http.StatusServiceUnavailable {
+		t.Errorf("/healthcheck with the database closed = %d; want 503", got.Code)
+	}
+	if strings.Contains(got.Body.String(), "sql:") {
+		t.Errorf("/healthcheck told the prober %q; it should say nothing of the failure", got.Body.String())
+	}
+}
+
 func TestLoadConfig(t *testing.T) {
 	// A set of flags of the shapes a real configuration would set, kept apart
 	// from the process's own so that this cannot disturb another test.

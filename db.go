@@ -243,6 +243,15 @@ func withoutSQLComments(s string) string {
 	return b.String()
 }
 
+// Ping reports whether the database is reachable, reconnecting if it can. It
+// is what a healthcheck asks, so it must be cheap: no query, just a connection.
+func (s *DB) Ping() error {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.db.Ping()
+}
+
 // Now returns the current time.
 func (s *DB) Now() time.Time {
 	return tstime.DefaultClock{Clock: s.clock}.Now()
