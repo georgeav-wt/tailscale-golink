@@ -739,40 +739,138 @@ container. The `--build` matters: without it the import runs whatever the image 
 built from last, which was how "--sqlitedb is required" came out of a run whose
 environment plainly had a DSN in it.
 
-### 16. Deployment shape
+### 16. The cluster: two images, three apps, three repos
 
-nginx → oauth2-proxy (Google) → golink:
+**Three apps make one service**, and they are three only because the deployment
+chart gives an Application one image:
 
 ```
--dev-listen :8080 -open-links -sqlitedb /home/nonroot/golink.db
--auth-email-header X-Auth-Request-Email -auth-groups-header X-Auth-Request-Groups
+ALB (internal) -> wt-golink-nginx -> (subrequest) wt-oauth2-proxy -> Google
+                                  -> wt-golink -> RDS MySQL
 ```
 
-Add `-owner-can-lock` if locking should not be an admin-only decision, and
-`-admin-only-export` to hold the whole-link-set export to admins.
+| | image | built from | why it is separate |
+|---|---|---|---|
+| `wt-golink` | `golink` | this repo's `Dockerfile` (upstream's, unchanged) | the app |
+| `wt-golink-nginx` | `golink_nginx` | this repo's `deploy/nginx/Dockerfile` | the config is in the image, so one tag names one behaviour |
+| `wt-oauth2-proxy` | `docker_base_images/oauth2-proxy` | nothing of ours -- mirror upstream's into ECR | nothing of ours in it |
 
-With MySQL instead, `-mysql` from `$GOLINK_MYSQL_DSN` in a Secret, and no PVC; that
-is what more than one replica needs (step 15).
+**What goes where.** Three repos, and the split is not obvious from any of them:
 
-For more than one replica, two Secret values must be **the same in every pod** -- golink's
-`GOLINK_XSRF_KEY` and oauth2-proxy's `--cookie-secret`. See step 14; note that SQLite
-on a PVC cannot back more than one pod at all.
+- **this repo** -- the two Dockerfiles and the nginx config that is baked into one
+  of them. Nothing else about the deployment.
+- **`wetravel-com/argo-gitops`** -- the Kubernetes resources, as Helm *values* for
+  the shared `helm/wt-service` chart. There are no manifests to write: one values
+  file per app plus an element in the production ApplicationSet, and the chart
+  renders the Deployment, Service, Ingress, PDB, VPA and NetworkPolicies.
 
-Forgetting `-open-links` silently gives you upstream's owner-locked model.
-Forgetting `-auth-email-header` silently makes **everyone** `foo@example.com`,
-the dev-mode user — the one failure here that is silent rather than closed,
-so assert on it after deploying: create a link and check its owner.
-SQLite on a PVC means a single replica; MySQL is what lifts that. Image runs as
-uid 65532 with home `/home/nonroot`.
-Back up via `-snapshot` and `/.export` (JSON Lines).
+  ```
+  helm/values/wt_golink/{base,production}.yaml
+  helm/values/wt_golink_nginx/{base,production}.yaml
+  helm/values/wt_oauth2_proxy/{base,production}.yaml
+  appsets/production.yaml            # one element per app: appName + valuesDir
+  ```
+
+  Values are layered `common/production.yaml` -> `<app>/base.yaml` ->
+  `<app>/production.yaml`, last wins. Render before pushing:
+
+  ```sh
+  helm template test helm/wt-service -f helm/values/common/production.yaml \
+      -f helm/values/wt_golink/base.yaml -f helm/values/wt_golink/production.yaml \
+      --set release=production
+  ```
+
+- **`wetravel-com/infrastructure`** -- everything the values *reference* and cannot
+  create: the ECR repositories (`aws/modules/ecr_registry`), the `golink` database
+  and its `golink_prod` user on the production RDS, the Secret keys those values
+  name, the DNS record for `go.wetravel.com`, and this repo's registration in
+  `github/` so it gets the standard `build_and_test.yml` -- which is also what
+  patches `imageTag` in argo-gitops after a build.
+
+**Secrets the values name** (nothing here may reach a command line):
+
+| ref | what |
+|---|---|
+| `@secret/mysql-users/host` | the RDS endpoint, as every other service reads it |
+| `@secret/mysql-users/golink_prod` | that user's password; the DSN is assembled from the two in `GOLINK_MYSQL_DSN` |
+| `@secret/golink/xsrfKey` | **the same in every pod**, or half the saves fail (step 14) |
+| `@secret/golink/cookieSecret` | oauth2-proxy's, also the same in every pod |
+| `@secret/golink/oauthClientId`, `oauthClientSecret` | the Google OAuth client |
+
+**Everything listens on 9292.** Not a preference: the platform's NetworkPolicy
+allows pod-to-pod traffic on ports 80 and 9292 and nothing else, so a golink on
+8080 is reachable from nginx only by writing an extra policy. The chart's Service,
+probe and Ingress all follow `port`, so one number settles it.
+
+**Probes.** `-healthcheck-path=/healthcheck` is what makes the
+chart's `startupProbe` and `readinessProbe` work, and it is *that* path because
+the chart annotates every Service with a Datadog `http_check` pointing at
+`/healthcheck` with no way to name another. nginx answers `/healthcheck` itself,
+**before** the auth subrequest -- a probe that got a 302 to Google would never
+report healthy, and an ALB target group with no healthy targets serves nothing.
+oauth2-proxy is given `--ping-path=/healthcheck` for the same reason.
+
+**Two things about nginx in the cluster:**
+
+- It resolves `wt-golink` **once, at startup**, and refuses to start at all if the
+  name does not exist (`host not found in upstream`). Deploying it before golink's
+  Service therefore crashloops until that Service appears -- it recovers by itself,
+  and sync waves do not order apps an ApplicationSet generates, so expect it on a
+  first deploy. Resolve-once is otherwise right here: a Service keeps its ClusterIP
+  for life, which is exactly what compose does not do (see local development).
+- TLS ends at the ALB, so nginx sees plain HTTP. `forwarded.conf` takes the scheme
+  from `X-Forwarded-Proto`; without it oauth2-proxy would send people back to an
+  `http://` URL after signing in.
+
+**The flags to get right**, in `command:` because the image's own CMD names a
+SQLite file:
+
+```
+/golink -dev-listen=:9292 -open-links -admin-only-export
+        -healthcheck-path=/healthcheck
+        -auth-email-header=X-Auth-Request-Email -auth-groups-header=X-Auth-Request-Groups
+```
+
+`-dev-listen` is the flag for "serve plain HTTP, do not join a tailnet"; it is not
+a debug mode. Forgetting `-open-links` silently gives you upstream's owner-locked
+model. Forgetting `-auth-email-header` silently makes **everyone**
+`foo@example.com`, the dev-mode user -- the one failure here that is silent rather
+than closed, so assert on it after deploying: create a link and check its owner.
+Add `-owner-can-lock` if locking should not be an admin-only decision. The image
+runs as uid 65532 with home `/home/nonroot`. Back up with `/.export`, which is
+also the only thing that moves links between backends.
+
+**The open risk, stated plainly.** golink cannot tell an identity header nginx set
+from one a client sent, and the chart's NetworkPolicy lets *any pod in the cluster*
+reach a serving port ("authorization is the mesh's job"). So the guarantee this
+design needs -- only nginx talks to golink -- is not what the platform's default
+gives: any compromised pod could create, edit or delete links as anyone, and read
+every link. `hasIngress: false` keeps golink off the internet, which is the larger
+half. Closing the rest means one of:
+
+- `networkPolicy.enabled: false` on the golink app plus hand-written policies
+  through `extraNetworkPolicies` (a NetworkPolicy union cannot subtract, so the
+  chart's permissive rule has to stop rendering rather than be narrowed);
+- a Linkerd `AuthorizationPolicy`, which the chart does not render; or
+- a shared secret header that nginx sets and golink requires -- the same shape as
+  the `INTERNAL_API_KEY` every other service here uses. That is a change to this
+  fork, roughly a flag and a check in `proxyUser`, and is not written.
+
+**Verified locally against the k8s config**, with a stub in place of oauth2-proxy
+and everything on 9292: `/healthcheck` answers 200 without a session, `go/ABC-1234`
+redirects to Jira ahead of auth, a link created through nginx is owned by the
+session's user, and **a request that forges `X-Auth-Request-Email` still comes out
+as the session's user**. Re-run that last one if this config is ever rewritten.
 
 **There is no schema migration, and that only bites after this is deployed.**
 (And there are now two schema files to add the column to, not one.)
 `schema.sql` is executed on every start, and `CREATE TABLE IF NOT EXISTS` creates a
 missing *table* but never adds a column to a table that is already there. So a column
-added once the PVC holds data will simply be absent, and every query naming it will
+added once the database holds data will simply be absent, and every query naming it will
 fail. Adding one then means putting an `ALTER TABLE` back into `newDB`, for whichever
-dialects are in use, or running it by hand against the database. There was such a migration during development, for
+dialects are in use, or running it by hand -- against RDS, which is a change no
+rollback of the image undoes, so the column has to be added before the code that
+needs it ships. There was such a migration during development, for
 databases that only ever existed on one laptop; the shape to copy is in
 
 ```sh
