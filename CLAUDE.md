@@ -539,7 +539,7 @@ none of them can conflict on a rebase.
 
 | File | What it is |
 |---|---|
-| `deploy/nginx/patterns.conf` | the `map` of bare patterns, shared by both server blocks |
+| `deploy/nginx/patterns.conf` | the `map` of bare patterns, shared by all three server blocks |
 | `deploy/nginx/golink.conf` | production: oauth2-proxy authenticates every request |
 | `deploy/nginx/golink-dev.conf` | local: authenticates nobody, hands golink a fixed identity |
 | `compose.yaml` | nginx + golink locally, using the dev config |
@@ -552,9 +552,26 @@ an unmatched Host.
 **Verified against a running stack**, both configs, the production one with a stub
 standing in for oauth2-proxy:
 
-- `go/ABC-1234` and `go/ABC-1234/` redirect to Jira, deliberately *ahead* of the auth
-  subrequest: it discloses nothing and keeps a Jira link working while a session
-  expires. golink's own lowercase routes are untouched by the pattern.
+- `go/WTRAV-1234` and `go/WTRAV-1234/` redirect to `go/jira/WTRAV-1234`, and the
+  `jira` link's pattern takes it from there. **nginx knows the shape of a ticket
+  and nothing else** -- not Jira's hostname, not its URL shape -- so moving Jira
+  is an edit to one link that anyone can make, with no deploy, and `go/jira/X`
+  typed by hand agrees with `go/X` by construction. The 24 project keys are
+  listed rather than matched by shape, because `~*^/([a-z][a-z0-9]+-\d+)$` would
+  also swallow a link somebody named `go/q1-2026`; adding a project is one line.
+  **The match is case-insensitive and the key is rewritten to upper case**, so
+  `go/wtrav-1` and `go/WtRav-1` both reach `browse/WTRAV-1` -- which is why there
+  is a line per project rather than one regex over an alternation: nginx cannot
+  upper-case a captured string, so each line carries its own canonical key. The
+  price is that a *link* of that shape can no longer be reached: `go/pd-1234`,
+  `go/it-2026` and `go/br-99` now redirect to Jira instead. There were none when
+  this changed, and the short keys (BI, BR, IE, IS, IT, PD, PI) are the ones to
+  keep in mind; golink's own routes are safe, since they all begin with a dot.
+  The redirect stays ahead of the auth subrequest, but it no longer
+  *serves* the ticket without a session, since the second hop is a golink path;
+  oauth2-proxy returns you to it after signing in. **`go/jira` must exist and
+  have a pattern**, or these land on the create form for the name
+  `jira/WTRAV-1234` -- a visible failure rather than a broken redirect.
 - With no session, every other path returns the sign-in page. With a session, golink is
   served and a link created through nginx is owned by the session's user.
 - **A request that forges `X-Auth-Request-Email` while holding a valid session still
@@ -568,6 +585,16 @@ standing in for oauth2-proxy:
 
 Two things learned the hard way while testing:
 
+- **A relative `return 302` becomes absolute, using the port nginx listens on.**
+  Sending `/jira/WTRAV-1234` from a server listening on 9292 produced
+  `Location: http://host:9292/jira/WTRAV-1234` -- wrong port and wrong scheme
+  behind a load balancer that terminates TLS on 443, and a link that goes
+  nowhere. `absolute_redirect off` in all three server blocks makes the Location
+  relative, which the browser resolves against whatever URL it asked for. This
+  was invisible while the patterns redirected straight to Jira, because nginx
+  passes an absolute URL through untouched; it appeared the moment the target
+  became a path, and it was the baked image -- reached on a port nginx does not
+  listen on, as through an ALB -- that showed it.
 - **`proxy_pass` with a literal name resolves once, at startup.** Recreating the
   upstream container gave it a new address and nginx went on using the old one, 502ing
   until it was restarted. A Kubernetes Service has a stable ClusterIP so this is fine;
@@ -857,9 +884,9 @@ half. Closing the rest means one of:
   fork, roughly a flag and a check in `proxyUser`, and is not written.
 
 **Verified locally against the k8s config**, with a stub in place of oauth2-proxy
-and everything on 9292: `/healthcheck` answers 200 without a session, `go/ABC-1234`
-redirects to Jira ahead of auth, a link created through nginx is owned by the
-session's user, and **a request that forges `X-Auth-Request-Email` still comes out
+and everything on 9292: `/healthcheck` answers 200 without a session,
+`go/wtrav-1234` redirects to `go/jira/WTRAV-1234` ahead of auth with a relative
+Location, a link created through nginx is owned by the session's user, and **a request that forges `X-Auth-Request-Email` still comes out
 as the session's user**. Re-run that last one if this config is ever rewritten.
 
 **There is no schema migration, and that only bites after this is deployed.**
