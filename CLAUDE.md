@@ -645,14 +645,25 @@ random per-process key remains, so a single instance needs no configuration.
   The fixture owner is `foo@example.com`, the dev-mode user, so the token is the only
   thing that can decide the outcome.
 
-**The click counter.** `stats.clicks` is an in-memory total flushed to the `Stats`
-ledger every 5 seconds. Two instances each held their own total, so whichever flushed
-last overwrote the other's — `INSERT OR REPLACE` on `(ID, Created)`, one row per minute.
-`flushStats` now reads the totals back after saving, so each instance picks up what the
-others recorded and the two converge within a flush. `TestFlushStatsReloadsTotals`
-covers it.
+**The click counter.** A click bumps two in-memory maps: `stats.clicks`, the total the
+UI shows, and `stats.dirty`, what has not been written yet. Once a minute `flushStats`
+writes one `Stats` row per link that has clicks in it — a plain `INSERT`, so rows
+accumulate and the table is a **ledger summed on read**, never a counter that anything
+overwrites.
 
-**Shutdown.** Up to 5 seconds of clicks lived only in memory, and a rolling deploy kills
+Which means the *database* was already right with two instances; what was wrong was
+what each instance **showed**. `stats.clicks` is seeded from the database at boot and
+then only ever grew by that instance's own clicks, so A under-reported every click B
+served until A restarted. `flushStats` now re-reads the totals after writing — always,
+not only when it had something to write, so an instance receiving no traffic still
+catches up — and the two agree within a minute. `TestFlushStatsReloadsTotals` covers
+both halves.
+
+The commit message for this change says the flushes overwrote each other, and the
+first version of this note said `INSERT OR REPLACE`. Both were wrong: nothing is
+replaced and nothing was lost, only displayed stale.
+
+**Shutdown.** Up to a minute of clicks lived only in memory, and a rolling deploy kills
 pods regularly. A SIGINT/SIGTERM handler flushes once and then re-raises the signal, so
 the process still dies the way its supervisor expects and the exit status still says
 "killed by signal". It is best-effort: a `SIGKILL` after the grace period, or a crash,
