@@ -719,8 +719,11 @@ stack -- the golink service is defined identically in both -- and
 The two backends hold **different links**; nothing carries them across but `/.export`
 and `import.sh`. Its data is a named volume rather than a directory in the tree,
 unlike the SQLite file, because a MySQL data directory is written from inside the
-container and a bind mount makes that a permissions problem for nothing; `podman
-compose down -v` throws it away. Admins are managed with the `mysql` client instead
+container and a bind mount makes that a permissions problem for nothing. It survives
+a restart, a rebuild, a recreate and `podman compose down`; only `down -v`, a
+`podman volume rm`, or a `podman system prune --volumes` throws it away -- which is one
+notch less safe than the bind mount the SQLite file lives in, and the reason `/.export`
+rather than the volume is the backup. Admins are managed with the `mysql` client instead
 of `sqlite3`:
 
 ```sh
@@ -821,6 +824,17 @@ nginx` to be somebody else. `podman compose down -v` throws the links away.
 container with a new address, and nginx resolved the old one at startup, so it will 502
 until `podman compose restart nginx`. Same root cause as the note in step 7; both start
 scripts do it for you, which is most of why they exist.
+
+**`podman compose restart` is not how to bring the stack back** -- `./start-dev.sh` is.
+Restart starts every container at once, and two things then go wrong at once: golink
+pings MySQL, finds it not yet listening, and exits, whereupon nginx will not start
+either, because it refuses to resolve an upstream that is not there
+(`host not found in upstream "golink"`). Both were observed, and both are why every
+service now carries `restart: unless-stopped` -- with it, nothing stays dead. What the
+policies cannot fix is nginx still holding golink's *old* address, so a restarted stack
+serves 502 until nginx is restarted after golink, which is exactly what the start
+scripts do last. **None of this touches the links**: verified by killing every container
+in the MySQL stack and bringing it back with all 47 still there.
 
 **The database is `./data/golink.db`, a bind mount, not a named volume.** A named
 volume was silently removed once by a `podman compose` invocation meant only to swap

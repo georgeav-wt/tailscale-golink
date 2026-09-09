@@ -51,8 +51,19 @@ podman compose $compose_files up -d --build --remove-orphans
 # container a new one. Without this, nginx serves 502 until it is restarted.
 podman compose $compose_files restart nginx
 
-if curl -sf --retry 30 --retry-delay 1 --retry-connrefused --max-time 60 \
-        -o /dev/null "http://localhost:$port/"; then
+# Poll for a 200 rather than leaving it to curl's --retry, which called the
+# stack dead while it was merely still coming up: nginx had been asked to
+# restart a moment earlier, and neither its refused connections nor its 502s
+# were retried the way they were meant to be.
+deadline=$(( $(date +%s) + 90 ))
+while :; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://localhost:$port/" || true)
+    [ "$code" = 200 ] && break
+    [ "$(date +%s)" -lt "$deadline" ] || break
+    sleep 1
+done
+
+if [ "$code" = 200 ]; then
     echo
     echo "golink is at http://localhost:$port/ -- every visitor is dev@wetravel.com,"
     echo "and the links are in $backend."
@@ -69,6 +80,7 @@ if curl -sf --retry 30 --retry-delay 1 --retry-connrefused --max-time 60 \
         echo "  echo \"rdr pass on lo0 inet proto tcp from any to 127.0.0.1 port $port -> 127.0.0.1 port 8080\" | sudo pfctl -Ef -"
     fi
 else
-    echo "golink did not come up; try: podman compose $compose_files logs" >&2
+    echo "golink did not come up (last response: ${code:-none}); try:" >&2
+    echo "  podman compose $compose_files logs" >&2
     exit 1
 fi

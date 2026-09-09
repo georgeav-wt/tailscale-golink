@@ -2,8 +2,15 @@
 # deployment but with no authentication at all. nginx hands golink a fixed
 # identity, so the whole flow is browsable without Google.
 #
+#   ./start-dev.sh                        # the supported way in and back
 #   podman compose up -d --build
-#   podman compose restart nginx          # after a rebuild; see below
+#   podman compose restart nginx          # after a rebuild or a restart; see below
+#
+# **"podman compose restart" is not a way to bring this stack back.** It starts
+# everything at once, so golink races its database, and nginx goes on talking to
+# the address golink had before. The restart policies below mean nothing stays
+# dead, but nginx still needs restarting last, which is what the start scripts
+# are for.
 #   open http://localhost:8080/fadsfads   # the create form, name filled in
 #
 # nginx resolves golink's address once, when it starts. Rebuilding golink gives
@@ -37,6 +44,13 @@
 services:
   golink:
     build: .
+    # golink pings its database at startup and exits if it cannot reach it, so a
+    # restart that races MySQL kills it -- and nginx then refuses to start at
+    # all, since it will not resolve an upstream that is not there. In the
+    # cluster that pair is a crashloop with backoff, which recovers on its own;
+    # here it needs saying. "unless-stopped" rather than "always", so that
+    # import.sh stopping golink deliberately leaves it stopped.
+    restart: unless-stopped
     command:
       - -dev-listen=:8080
       - -sqlitedb=/home/nonroot/golink.db
@@ -52,6 +66,7 @@ services:
 
   nginx:
     image: docker.io/library/nginx:1.29-alpine
+    restart: unless-stopped
     ports:
       # The whole spec, because which addresses can be used depends on the
       # port: podman will bind a privileged port only to every address, never

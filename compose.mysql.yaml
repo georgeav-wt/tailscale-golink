@@ -48,10 +48,16 @@ services:
         # golink pings the database at startup and exits if it cannot reach it,
         # which in the cluster is a crashloop with backoff -- the right
         # behaviour there, and merely noisy here, so wait for the server.
+        #
+        # This is honoured by "up" and **not** by "restart", which starts
+        # everything at once: golink loses that race, exits, and takes nginx
+        # with it. That is what the restart policies are for. Bring the stack
+        # back with ./start-dev.sh rather than "podman compose restart".
         condition: service_healthy
 
   mysql:
     image: docker.io/library/mysql:8.4
+    restart: unless-stopped
     environment:
       - MYSQL_DATABASE=golink
       - MYSQL_USER=golink

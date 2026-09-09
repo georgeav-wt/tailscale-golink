@@ -10,6 +10,13 @@
 services:
   golink:
     build: .
+    # golink pings its database at startup and exits if it cannot reach it, so a
+    # restart that races MySQL kills it -- and nginx then refuses to start at
+    # all, since it will not resolve an upstream that is not there. In the
+    # cluster that pair is a crashloop with backoff, which recovers on its own;
+    # here it needs saying. "unless-stopped" rather than "always", so that
+    # import.sh stopping golink deliberately leaves it stopped.
+    restart: unless-stopped
     command:
       - -dev-listen=:8080
       - -sqlitedb=/home/nonroot/golink.db
@@ -32,6 +39,7 @@ services:
 
   oauth2-proxy:
     image: quay.io/oauth2-proxy/oauth2-proxy:v7.7.1
+    restart: unless-stopped
     command:
       - --provider=google
       - --http-address=0.0.0.0:4180
@@ -54,6 +62,7 @@ services:
 
   nginx:
     image: docker.io/library/nginx:1.29-alpine
+    restart: unless-stopped
     ports:
       # The whole spec, because which addresses can be used depends on the
       # port: podman will bind a privileged port only to every address, never
